@@ -22,6 +22,7 @@ class AlphabetTrackList extends StatefulWidget {
     this.selectedUris = const <String>{},
     this.onSelectToggle,
     this.onSelectStart,
+    this.onSelectRange,
     super.key,
   });
 
@@ -41,8 +42,13 @@ class AlphabetTrackList extends StatefulWidget {
   /// Toggles a track's selection (tap while in selection mode).
   final void Function(Track track)? onSelectToggle;
 
-  /// Starts selection with a track (long-press).
+  /// Starts selection with a track (long-press, or a Ctrl-click from nothing).
   final void Function(Track track)? onSelectStart;
+
+  /// Shift-click: extend the selection to a row, over the list *as sorted
+  /// here*. This list sorts its own rows, so the host cannot compute a range
+  /// against the tracks it handed in.
+  final void Function(List<Track> tracks, int index)? onSelectRange;
 
   @override
   State<AlphabetTrackList> createState() => _AlphabetTrackListState();
@@ -51,8 +57,15 @@ class AlphabetTrackList extends StatefulWidget {
 class _AlphabetTrackListState extends State<AlphabetTrackList> {
   /// Fixed extents let the index compute an exact scroll offset for any letter
   /// without measuring laid-out widgets.
+  ///
+  /// The row extent follows the theme's [VisualDensity] rather than being one
+  /// number for everyone (#384): a desktop theme is compact, and a list of song
+  /// rows is where that difference is worth the most — eight pixels a row is a
+  /// couple more songs per screen on every scroll. Touch keeps 64 exactly.
+  static const double _baseTrackExtent = 64;
   static const double _headerExtent = 36;
-  static const double _trackExtent = 64;
+
+  double _trackExtent = _baseTrackExtent;
 
   /// Width of the trailing A–Z rail. The list reserves this much right-side
   /// padding so rows (and the 3-dot overflow menu) never sit under the rail.
@@ -78,6 +91,21 @@ class _AlphabetTrackListState extends State<AlphabetTrackList> {
     super.initState();
     _rebuildIndex();
     _controller.addListener(_syncActiveLetter);
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // The per-letter offsets are measured in row extents, so a density change
+    // (a theme swap, or this list being rebuilt on another platform in a test)
+    // has to re-derive them or the rail would scroll to the wrong song.
+    final double extent = (_baseTrackExtent +
+            Theme.of(context).visualDensity.baseSizeAdjustment.dy)
+        .clamp(48.0, _baseTrackExtent);
+    if (extent != _trackExtent) {
+      _trackExtent = extent;
+      _rebuildIndex();
+    }
   }
 
   @override
@@ -198,6 +226,7 @@ class _AlphabetTrackListState extends State<AlphabetTrackList> {
               onSelectStart: widget.onSelectStart == null
                   ? null
                   : () => widget.onSelectStart!(track),
+              onSelectRange: widget.onSelectRange,
             );
           },
         ),

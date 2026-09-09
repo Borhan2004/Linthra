@@ -99,6 +99,10 @@ CMAKELISTS = Path("linux") / "CMakeLists.txt"
 MY_APPLICATION = Path("linux") / "runner" / "my_application.cc"
 RUNNER_CMAKELISTS = Path("linux") / "runner" / "CMakeLists.txt"
 FOLDER_PICKER_CHANNEL_SOURCE = Path("linux") / "runner" / "folder_picker_channel.cc"
+WINDOW_STATE_STORE_SOURCE = Path("linux") / "runner" / "window_state_store.cc"
+WINDOW_STATE_POLICY_SOURCE = (
+    Path("native") / "linthra_desktop" / "src" / "window_state.cpp"
+)
 FOLDER_PICKER_DART = (
     Path("lib") / "core" / "services" / "method_channel_linux_folder_picker.dart"
 )
@@ -277,6 +281,7 @@ NON_UNIQUE_FLAG = "G_APPLICATION_NON_UNIQUE"
 # than being pasted into the runner as a second copy.
 RUNNER_IDENTITY_NEW_FUNCTION = "MyApplication* my_application_new()"
 RUNNER_IDENTITY_STARTUP_FUNCTION = "static void my_application_startup("
+RUNNER_SHUTDOWN_FUNCTION = "static void my_application_shutdown("
 RUNNER_STARTUP_CHAIN_UP = (
     "G_APPLICATION_CLASS(my_application_parent_class)->startup(application)"
 )
@@ -926,6 +931,56 @@ def _function_body(code: str, signature: str, where: Path) -> tuple[int, int]:
     raise CheckError(f"{where}: {signature} has an unterminated body")
 
 
+def window_state_problems(root: Path) -> list[str]:
+    """Ways the window-state wiring (#383) can vanish without failing a build.
+
+    Losing any one of these still compiles and still launches. The window just
+    stops remembering its size, which nobody notices in review and everybody
+    notices on the next launch.
+    """
+    problems: list[str] = []
+
+    runner_cmakelists = _read(root, RUNNER_CMAKELISTS)
+    for source in (WINDOW_STATE_STORE_SOURCE, WINDOW_STATE_POLICY_SOURCE):
+        if source.name not in runner_cmakelists:
+            problems.append(
+                f"{RUNNER_CMAKELISTS} does not compile {source.name}, so the "
+                "window cannot remember its size"
+            )
+    # The policy is C++17 (string_view, from_chars). apply_standard_settings
+    # only asks for cxx_std_14, which is a floor: without this the standard is
+    # whatever the host compiler happens to default to.
+    if "cxx_std_17" not in runner_cmakelists:
+        problems.append(
+            f"{RUNNER_CMAKELISTS} no longer requires cxx_std_17, which the "
+            f"{WINDOW_STATE_POLICY_SOURCE.name} policy needs"
+        )
+
+    my_application = _blank(_read(root, MY_APPLICATION))
+    if "window_state_store_new" not in my_application:
+        problems.append(
+            f"{MY_APPLICATION} never calls window_state_store_new(), so the "
+            "saved window geometry is never restored"
+        )
+
+    # Specifically inside my_application_shutdown(), not just somewhere in the
+    # file. There is a second save on the window-recreation path in activate(),
+    # so a plain substring search would keep passing while the one that runs on
+    # every ordinary exit — the only one that persists the geometry a session
+    # ends with — had been dropped by a merge or a regeneration.
+    shutdown_start, shutdown_end = _function_body(
+        my_application, RUNNER_SHUTDOWN_FUNCTION, MY_APPLICATION
+    )
+    if "window_state_store_save" not in my_application[shutdown_start:shutdown_end]:
+        problems.append(
+            f"{MY_APPLICATION}: my_application_shutdown() never calls "
+            "window_state_store_save(), so an ordinary exit never writes the "
+            "window geometry and every launch is a first one"
+        )
+
+    return problems
+
+
 def runner_identity_problems(root: Path) -> list[str]:
     """Identity calls the runner has to make, in the places they still work.
 
@@ -1067,6 +1122,7 @@ def check(root: Path) -> list[str]:
     # window answer to the same id as everything installed above, in the places
     # where they still take effect.
     problems.extend(runner_identity_problems(root))
+    problems.extend(window_state_problems(root))
 
     # Window metrics: a minimum larger than the default would open the window
     # already clamped, which reads as the app ignoring its own default.

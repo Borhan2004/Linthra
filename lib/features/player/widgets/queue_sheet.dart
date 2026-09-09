@@ -7,6 +7,7 @@ import '../../../app/dimens.dart';
 import '../../../core/models/playback_state.dart';
 import '../../../core/models/playlist.dart';
 import '../../../core/models/track.dart';
+import '../../../core/repositories/playlist_repository.dart';
 import '../../../data/repositories/playlist_repository_provider.dart';
 import '../../../shared/widgets/now_playing_indicator.dart';
 import '../../playlists/widgets/create_playlist_dialog.dart';
@@ -30,6 +31,13 @@ Future<void> showQueueSheet(BuildContext context) {
 
 /// The Queue / Up Next manager.
 ///
+/// Hosted two ways. As a modal sheet ([showQueueSheet]) it keeps its own height
+/// budget and safe-area inset, the way a sheet has to. As an [embedded] pane —
+/// what a desktop-width Now Playing does with it — it fills whatever box the
+/// host gives it instead: the pane is already inside the screen's padding, and
+/// a sheet's 85%-of-the-window ceiling in a column that is the full window tall
+/// would leave a band of dead space under the list.
+///
 /// Reads the live [PlaybackState] (so it stays current while open) and shows,
 /// top to bottom: a header with Save/Clear actions, the played history, the
 /// current track, and the reorderable up-next list. Every edit goes through the
@@ -38,7 +46,10 @@ Future<void> showQueueSheet(BuildContext context) {
 /// never start a second, duplicate playback (local or cast). It only ever holds
 /// catalog [Track]s, never a resolved/authenticated stream URL.
 class QueueSheet extends ConsumerWidget {
-  const QueueSheet({super.key});
+  const QueueSheet({this.embedded = false, super.key});
+
+  /// Whether the host lays this out as a pane rather than a modal sheet.
+  final bool embedded;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -65,75 +76,77 @@ class QueueSheet extends ConsumerWidget {
     final bool canClear = upNext.isNotEmpty || history.isNotEmpty;
     final bool canSave = current != null;
 
+    final Widget body = Column(
+      mainAxisSize: embedded ? MainAxisSize.max : MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        Padding(
+          padding: const EdgeInsets.fromLTRB(
+            AppSpacing.lg,
+            0,
+            AppSpacing.sm,
+            AppSpacing.sm,
+          ),
+          child: Row(
+            children: <Widget>[
+              Icon(Icons.queue_music, color: theme.colorScheme.primary),
+              const SizedBox(width: AppSpacing.sm),
+              Text('Queue', style: theme.textTheme.titleMedium),
+              const Spacer(),
+              IconButton(
+                onPressed: canSave ? () => _saveAsPlaylist(context, ref) : null,
+                icon: const Icon(Icons.playlist_add),
+                tooltip: 'Save queue as playlist',
+              ),
+              TextButton(
+                onPressed: canClear ? controller.clearQueue : null,
+                child: const Text('Clear'),
+              ),
+            ],
+          ),
+        ),
+        Flexible(
+          child: current == null
+              ? const _EmptyQueue()
+              : CustomScrollView(
+                  slivers: <Widget>[
+                    if (history.isNotEmpty) ...<Widget>[
+                      const _SectionLabel(label: 'Previously played'),
+                      SliverList.builder(
+                        itemCount: history.length,
+                        itemBuilder: (context, index) => _HistoryTile(
+                          track: history[index],
+                          onTap: () => ref
+                              .read(playbackControllerProvider)
+                              .playFromHistory(index),
+                        ),
+                      ),
+                    ],
+                    const _SectionLabel(label: 'Now playing'),
+                    SliverToBoxAdapter(
+                      child: _CurrentTile(track: current),
+                    ),
+                    const _SectionLabel(label: 'Up next'),
+                    if (upNext.isEmpty)
+                      const SliverToBoxAdapter(child: _NothingUpNext())
+                    else
+                      _UpNextList(tracks: upNext),
+                    const SliverToBoxAdapter(
+                      child: SizedBox(height: AppSpacing.md),
+                    ),
+                  ],
+                ),
+        ),
+      ],
+    );
+
+    if (embedded) return body;
     return SafeArea(
       child: ConstrainedBox(
         constraints: BoxConstraints(
           maxHeight: MediaQuery.sizeOf(context).height * 0.85,
         ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: <Widget>[
-            Padding(
-              padding: const EdgeInsets.fromLTRB(
-                AppSpacing.lg,
-                0,
-                AppSpacing.sm,
-                AppSpacing.sm,
-              ),
-              child: Row(
-                children: <Widget>[
-                  Icon(Icons.queue_music, color: theme.colorScheme.primary),
-                  const SizedBox(width: AppSpacing.sm),
-                  Text('Queue', style: theme.textTheme.titleMedium),
-                  const Spacer(),
-                  IconButton(
-                    onPressed:
-                        canSave ? () => _saveAsPlaylist(context, ref) : null,
-                    icon: const Icon(Icons.playlist_add),
-                    tooltip: 'Save queue as playlist',
-                  ),
-                  TextButton(
-                    onPressed: canClear ? controller.clearQueue : null,
-                    child: const Text('Clear'),
-                  ),
-                ],
-              ),
-            ),
-            Flexible(
-              child: current == null
-                  ? const _EmptyQueue()
-                  : CustomScrollView(
-                      slivers: <Widget>[
-                        if (history.isNotEmpty) ...<Widget>[
-                          const _SectionLabel(label: 'Previously played'),
-                          SliverList.builder(
-                            itemCount: history.length,
-                            itemBuilder: (context, index) => _HistoryTile(
-                              track: history[index],
-                              onTap: () => ref
-                                  .read(playbackControllerProvider)
-                                  .playFromHistory(index),
-                            ),
-                          ),
-                        ],
-                        const _SectionLabel(label: 'Now playing'),
-                        SliverToBoxAdapter(
-                          child: _CurrentTile(track: current),
-                        ),
-                        const _SectionLabel(label: 'Up next'),
-                        if (upNext.isEmpty)
-                          const SliverToBoxAdapter(child: _NothingUpNext())
-                        else
-                          _UpNextList(tracks: upNext),
-                        const SliverToBoxAdapter(
-                          child: SizedBox(height: AppSpacing.md),
-                        ),
-                      ],
-                    ),
-            ),
-          ],
-        ),
+        child: body,
       ),
     );
   }
@@ -147,7 +160,12 @@ class QueueSheet extends ConsumerWidget {
     BuildContext context,
     WidgetRef ref,
   ) async {
+    // Both captured before the dialog: embedded in the player's queue pane,
+    // this sheet is unmounted the moment the window narrows past the pane's
+    // minimum, and a resize while the name prompt is up would otherwise leave
+    // the save reaching through a disposed ref on submit.
     final ScaffoldMessengerState messenger = ScaffoldMessenger.of(context);
+    final PlaylistRepository repository = ref.read(playlistRepositoryProvider);
     // Read the freshest full queue at tap time rather than capturing it in
     // build — build now selects only the queue identity (see above), and a save
     // is a one-off action, not a hot path.
@@ -162,7 +180,6 @@ class QueueSheet extends ConsumerWidget {
     final PlaylistEdit? edit = await showCreatePlaylistDialog(context);
     if (edit == null) return;
 
-    final repository = ref.read(playlistRepositoryProvider);
     final Playlist created = await repository.createPlaylist(
       edit.name,
       description: edit.description,

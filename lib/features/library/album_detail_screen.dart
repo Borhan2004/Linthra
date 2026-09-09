@@ -8,6 +8,7 @@ import '../../core/catalog/library_grouping.dart';
 import '../../core/models/album.dart';
 import '../../core/models/track.dart';
 import '../../shared/layout/adaptive_layout.dart';
+import '../../shared/layout/pane_layout.dart';
 import '../../shared/widgets/empty_state.dart';
 import '../player/player_providers.dart';
 import '../player/widgets/album_artwork.dart';
@@ -15,7 +16,9 @@ import '../playlists/widgets/add_to_playlist_sheet.dart';
 import 'library_browse_providers.dart';
 import 'library_controller.dart';
 import 'library_state.dart';
+import 'track_selection.dart';
 import 'unified_library_providers.dart';
+import 'widgets/selection_escape_scope.dart';
 import 'widgets/track_tile.dart';
 
 /// One album's tracks, in album order, with Play / Shuffle and tap-to-play.
@@ -28,23 +31,36 @@ import 'widgets/track_tile.dart';
 /// Long-pressing a track starts multi-select so any subset can use that same
 /// playlist flow.
 class AlbumDetailScreen extends ConsumerStatefulWidget {
-  const AlbumDetailScreen({required this.albumId, super.key});
+  const AlbumDetailScreen({
+    required this.albumId,
+    this.selection,
+    super.key,
+  });
 
   final String albumId;
+
+  /// The selection to work in, when a host owns one.
+  ///
+  /// As a pushed route the screen keeps its own, and its lifetime is the
+  /// route's. As a detail pane it does not get to: the pane is dropped whenever
+  /// the window narrows past [listDetailMinWidth], which would reset a
+  /// selection the user is in the middle of on an ordinary resize. So the host
+  /// that holds *which* album is open holds what is picked inside it too, and
+  /// the pane can come and go without losing either.
+  final TrackSelection? selection;
 
   @override
   ConsumerState<AlbumDetailScreen> createState() => _AlbumDetailScreenState();
 }
 
-/// Width of the album pane in the desktop two-pane layout: enough for a
-/// comfortable cover and both transport buttons, narrow enough to leave the
-/// track list the majority of the window.
-const double _detailPaneWidth = 320;
-
 class _AlbumDetailScreenState extends ConsumerState<AlbumDetailScreen> {
-  final Set<String> _selectedUris = <String>{};
+  /// The selection used when no host supplied one.
+  final TrackSelection _ownSelection = TrackSelection();
 
-  bool get _selecting => _selectedUris.isNotEmpty;
+  /// Which songs are picked, and where a Shift-click measures from (#387).
+  TrackSelection get _selection => widget.selection ?? _ownSelection;
+
+  bool get _selecting => _selection.isActive;
 
   @override
   Widget build(BuildContext context) {
@@ -87,10 +103,7 @@ class _AlbumDetailScreenState extends ConsumerState<AlbumDetailScreen> {
     // Bound after the null check so the layout closures below see a non-null
     // album; a promoted local can't be captured by one.
     final Album resolved = album;
-    final List<Track> selected = <Track>[
-      for (final Track track in tracks)
-        if (_selectedUris.contains(track.uri)) track,
-    ];
+    final List<Track> selected = _selection.resolve(tracks);
 
     final Widget scaffold = Scaffold(
       appBar: _selecting
@@ -131,12 +144,18 @@ class _AlbumDetailScreenState extends ConsumerState<AlbumDetailScreen> {
     );
 
     if (!_selecting) return scaffold;
+    // Back leaves the selection on a phone; Escape is the desktop's Back, and
+    // the rows here take Ctrl and Shift clicks just like the songs list does.
     return PopScope(
       canPop: false,
       onPopInvokedWithResult: (bool didPop, _) {
         if (!didPop) _exitSelection();
       },
-      child: scaffold,
+      child: SelectionEscapeScope(
+        selecting: _selecting,
+        onEscape: _exitSelection,
+        child: scaffold,
+      ),
     );
   }
 
@@ -167,36 +186,23 @@ class _AlbumDetailScreenState extends ConsumerState<AlbumDetailScreen> {
   /// track list. Both read the same `tracks` list and the same selection set,
   /// so nothing here duplicates state — it is the single-column body, laid out.
   Widget _twoPaneBody(Album album, List<Track> tracks) {
-    return Center(
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: maxPaneLayoutWidth),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: <Widget>[
-            SizedBox(
-              width: _detailPaneWidth,
-              child: SingleChildScrollView(
-                child: _AlbumHeader(
-                  album: album,
-                  trackCount: tracks.length,
-                  stacked: true,
-                  onPlay: () => _play(context, tracks),
-                  onShuffle: () => _shuffle(context, tracks),
-                ),
-              ),
-            ),
-            const VerticalDivider(width: 1),
-            Expanded(
-              child: ListView.builder(
-                key: const Key('album_detail_tracks'),
-                padding: const EdgeInsets.symmetric(vertical: AppSpacing.sm),
-                itemCount: tracks.length,
-                itemBuilder: (BuildContext context, int index) =>
-                    _trackTile(tracks, index),
-              ),
-            ),
-          ],
+    return SplitPanes(
+      fixedWidth: sidePaneWidth,
+      fixed: SingleChildScrollView(
+        child: _AlbumHeader(
+          album: album,
+          trackCount: tracks.length,
+          stacked: true,
+          onPlay: () => _play(context, tracks),
+          onShuffle: () => _shuffle(context, tracks),
         ),
+      ),
+      flexible: ListView.builder(
+        key: const Key('album_detail_tracks'),
+        padding: const EdgeInsets.symmetric(vertical: AppSpacing.sm),
+        itemCount: tracks.length,
+        itemBuilder: (BuildContext context, int index) =>
+            _trackTile(tracks, index),
       ),
     );
   }
@@ -208,9 +214,10 @@ class _AlbumDetailScreenState extends ConsumerState<AlbumDetailScreen> {
       index: index,
       selectable: true,
       selectionActive: _selecting,
-      selected: _selectedUris.contains(track.uri),
+      selected: _selection.contains(track.uri),
       onSelectStart: () => _enterSelection(track),
       onSelectToggle: () => _toggle(track),
+      onSelectRange: _extendSelection,
     );
   }
 
@@ -234,28 +241,36 @@ class _AlbumDetailScreenState extends ConsumerState<AlbumDetailScreen> {
   }
 
   void _enterSelection(Track track) {
-    setState(() {
-      _selectedUris
-        ..clear()
-        ..add(track.uri);
-    });
+    setState(() => _selection.start(track));
+  }
+
+  /// Shift-click: everything between the anchor and the clicked row, over the
+  /// list that row is actually in.
+  void _extendSelection(List<Track> tracks, int index) {
+    setState(() => _selection.extendTo(tracks, index));
   }
 
   void _toggle(Track track) {
     setState(() {
-      if (!_selectedUris.add(track.uri)) {
-        _selectedUris.remove(track.uri);
-      }
+      _selection.toggle(track);
     });
   }
 
+  /// Leaves the selection.
+  ///
+  /// The clear is not guarded by [mounted], only the rebuild is: a host-owned
+  /// selection outlives this screen on purpose (see [AlbumDetailScreen.selection]), so
+  /// an action that finishes after a resize took the pane away still has to end
+  /// the mode it belongs to. Otherwise widening the window brings back a
+  /// selection whose work is already done.
   void _exitSelection() {
-    setState(_selectedUris.clear);
+    _selection.clear();
+    if (mounted) setState(() {});
   }
 
   Future<void> _addSelectedToPlaylist(List<Track> selected) async {
     await showAddToPlaylistSheet(context, selected);
-    if (mounted) _exitSelection();
+    _exitSelection();
   }
 
   void _play(BuildContext context, List<Track> tracks) {
