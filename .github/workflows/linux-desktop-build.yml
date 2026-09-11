@@ -139,14 +139,31 @@ jobs:
       #                                              plaintext credentials.
       #   libmpv-dev                                — media_kit audio backend;
       #                                              also supplies runtime libmpv
-      #   libasound2-plugins                        — ALSA null PCM for headless
-      #                                              native audio lifecycle smoke
       #   desktop-file-utils                        — desktop-file-validate, for
       #                                              the installed desktop entry
       - name: Install Linux build dependencies
         run: |
           set -euo pipefail
-          sudo apt-get update
+          # `apt-get update` exits 100 if *any* configured source fails, and the
+          # runner image ships third-party ones (Google Chrome, Microsoft) that
+          # none of the packages below come from. When one of those serves an
+          # index that disagrees with its own Release file, the whole job dies
+          # seconds in, having fetched every Ubuntu index perfectly well:
+          #
+          #   E: Failed to fetch .../chrome-stable/.../Packages.gz
+          #      Hash Sum mismatch
+          #
+          # So a partial update is tolerated and `apt-get install` below stays
+          # strict. That is the step whose success actually matters: if an index
+          # we really need is missing, the install fails on the package it
+          # cannot find, which is both louder and more honest than guessing here
+          # which sources were the important ones.
+          #
+          # Deliberately not deleting the offending source lists instead. Their
+          # names and format are the image's business (noble moved several to
+          # deb822 `.sources`), so matching on them is a check that silently
+          # stops working the next time the image is rebuilt.
+          sudo apt-get update || echo 'apt-get update was incomplete; the install below decides'
           sudo apt-get install -y --no-install-recommends \
             clang \
             cmake \
@@ -157,7 +174,6 @@ jobs:
             libstdc++-12-dev \
             libsecret-1-dev \
             libmpv-dev \
-            libasound2-plugins \
             desktop-file-utils \
             xauth \
             xvfb
@@ -212,29 +228,26 @@ jobs:
           fi
 
       # A normal Flutter widget test cannot load the Linux plugin bundle, so
-      # this target runs in the real GTK runner and opens a silent local WAV
-      # through libmpv without requiring audible output. Three load/play/stop/
-      # dispose cycles cover reinitialization.
+      # this target runs in the real GTK runner and walks a full transport
+      # lifecycle (initialize, load, play, pause, seek, stop, dispose) against
+      # a local WAV it generates, through libmpv, without requiring audible
+      # output. Three cycles cover reinitialization. The same target runs inside
+      # the packaged Flatpak (#446, docs/flatpak-audio-smoke.md); this run uses
+      # the host's libmpv and so says nothing about packaging.
       - name: Build native audio lifecycle smoke
         run: >-
           flutter build linux --release
           --target=tool/linux_audio_backend_smoke.dart
 
-      # libmpv autoselects PipeWire on ubuntu-latest, which has no audio device.
-      # The smoke target sets `ao=alsa`; route ALSA's default PCM to the null
-      # plugin for this step only — production builds keep the host's normal audio.
+      # libmpv autoselects PipeWire on ubuntu-latest, which has no audio device,
+      # so the smoke target defaults to libmpv's own `null` output. That output
+      # still paces samples against the system clock, which is what the new
+      # position/pause/seek assertions need; ALSA's null PCM does not, and a
+      # five-second fixture used to finish in milliseconds against it. The
+      # override applies to this run only; production builds keep the host's
+      # normal audio.
       - name: Run native audio lifecycle smoke
-        run: |
-          set -euo pipefail
-          alsa_null_conf="$(mktemp)"
-          trap 'rm -f "$alsa_null_conf"' EXIT
-          printf '%s\n' \
-            'pcm.!default { type plug; slave.pcm "null" }' \
-            'pcm.null { type null }' \
-            'ctl.!default { type null }' \
-            > "$alsa_null_conf"
-          ALSA_CONFIG_PATH="$alsa_null_conf" xvfb-run --auto-servernum \
-            build/linux/x64/release/bundle/linthra
+        run: xvfb-run --auto-servernum build/linux/x64/release/bundle/linthra
 
       # Release mode, because that is the build that has to work for packaging
       # and it exercises the AOT path a debug build skips.
@@ -284,6 +297,25 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Checked out first, and at the exact tag being released, for the
+      # containment verification below: the script and the message it compares
+      # against both live in the repository, and checkout cleans the workspace,
+      # so it has to run before the bundle is downloaded into it.
+      - name: Checkout the released tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.build-linux.outputs.release_tag }}
+
+      # Same split as the Android release build: the tag supplies the expected
+      # containment message, this workflow's own revision supplies the script
+      # that looks for it, so rebuilding an older tag is still verified.
+      - name: Check out the release tooling from this workflow's revision
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          path: .release-tooling
+          sparse-checkout: scripts
+
       # The artifact upload above stores the *contents* of
       # build/linux/x64/release/bundle at its root (linthra, lib/, data/, ...),
       # so downloading it directly into the archive's staging directory already
@@ -351,6 +383,34 @@ jobs:
           head -5 "$archive_list"
 
           echo "archive_file=${archive_file}" >> "$GITHUB_ENV"
+
+      # Casting is withheld from shipped builds while a reported security issue
+      # is resolved (lib/core/services/cast/cast_containment.dart). The Android
+      # release build makes the same check on its APK/AAB before uploading them;
+      # this is the Linux half, and it runs *before* the upload on purpose —
+      # the Release is already public by this point, so an artifact that failed
+      # the check must never become downloadable from it. Fails closed; see the
+      # script's docstring for what it can and cannot see.
+      - name: Verify the archive carries the Cast containment
+        env:
+          ARCHIVE_FILE: ${{ env.archive_file }}
+        run: |
+          set -euo pipefail
+
+          source_file="lib/core/services/cast/cast_containment.dart"
+
+          # Only a tag from before the containment existed has nothing to
+          # check; everything else is verified with the script from this
+          # workflow's revision against that tag's own message, so an old tag
+          # is never a way to attach an unverified asset.
+          if [ ! -f "$source_file" ] || ! grep -q 'static const String userMessage' "$source_file"; then
+            echo "::warning::This tag predates the Cast containment, so its archive carries nothing to check. See docs/release-artifact-verification.md."
+            exit 0
+          fi
+
+          python3 .release-tooling/scripts/verify_release_containment.py \
+            --containment-source "$source_file" \
+            "$ARCHIVE_FILE"
 
       - name: Attach archive to GitHub Release
         env:

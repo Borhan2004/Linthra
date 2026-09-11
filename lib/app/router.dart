@@ -3,10 +3,12 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../features/appearance/appearance_settings_screen.dart';
+import '../features/audiobooks/audiobooks_screen.dart';
 import '../features/downloads/downloads_screen.dart';
 import '../features/favorites/favorites_screen.dart';
 import '../features/library/album_detail_screen.dart';
 import '../features/library/artist_detail_screen.dart';
+import '../features/library/folders_screen.dart';
 import '../features/library/library_screen.dart';
 import '../features/onboarding/onboarding_controller.dart';
 import '../features/onboarding/onboarding_screen.dart';
@@ -27,14 +29,25 @@ import '../features/smart_mixes/smart_mixes_screen.dart';
 import '../features/support/support_screen.dart';
 import 'routes.dart';
 
+/// The root navigator's key.
+///
+/// Owned by a provider rather than created inside [appRouterProvider] so that
+/// app-level chrome sitting *above* the router — the keyboard shortcuts, which
+/// have to reach routes pushed over the shell — can address the same navigator
+/// the router builds on.
+final rootNavigatorKeyProvider = Provider<GlobalKey<NavigatorState>>((ref) {
+  return GlobalKey<NavigatorState>(debugLabel: 'root');
+});
+
 /// Single source of truth for navigation. Exposed through Riverpod so future
 /// guards (e.g. multi-user) can depend on app state.
 final appRouterProvider = Provider<GoRouter>((ref) {
   final GlobalKey<NavigatorState> rootNavigatorKey =
-      GlobalKey<NavigatorState>(debugLabel: 'root');
+      ref.watch(rootNavigatorKeyProvider);
   final List<GlobalKey<NavigatorState>> branchNavigatorKeys =
       <GlobalKey<NavigatorState>>[
     GlobalKey<NavigatorState>(debugLabel: 'libraryBranch'),
+    GlobalKey<NavigatorState>(debugLabel: 'foldersBranch'),
     GlobalKey<NavigatorState>(debugLabel: 'playlistsBranch'),
     GlobalKey<NavigatorState>(debugLabel: 'downloadsBranch'),
     GlobalKey<NavigatorState>(debugLabel: 'settingsBranch'),
@@ -91,6 +104,15 @@ final appRouterProvider = Provider<GoRouter>((ref) {
             navigatorKey: branchNavigatorKeys[1],
             routes: [
               GoRoute(
+                path: AppRoutes.folders,
+                builder: (context, state) => const FoldersScreen(),
+              ),
+            ],
+          ),
+          StatefulShellBranch(
+            navigatorKey: branchNavigatorKeys[2],
+            routes: [
+              GoRoute(
                 path: AppRoutes.playlists,
                 builder: (context, state) => const PlaylistsScreen(),
                 routes: [
@@ -121,7 +143,7 @@ final appRouterProvider = Provider<GoRouter>((ref) {
             ],
           ),
           StatefulShellBranch(
-            navigatorKey: branchNavigatorKeys[2],
+            navigatorKey: branchNavigatorKeys[3],
             routes: [
               GoRoute(
                 path: AppRoutes.downloads,
@@ -130,7 +152,7 @@ final appRouterProvider = Provider<GoRouter>((ref) {
             ],
           ),
           StatefulShellBranch(
-            navigatorKey: branchNavigatorKeys[3],
+            navigatorKey: branchNavigatorKeys[4],
             routes: [
               GoRoute(
                 path: AppRoutes.settings,
@@ -140,6 +162,10 @@ final appRouterProvider = Provider<GoRouter>((ref) {
                     path: 'connections',
                     builder: (context, state) =>
                         const ConnectionsSettingsScreen(),
+                  ),
+                  GoRoute(
+                    path: 'audiobooks',
+                    builder: (context, state) => const AudiobooksScreen(),
                   ),
                   GoRoute(
                     path: 'playback',

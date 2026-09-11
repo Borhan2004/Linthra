@@ -10,6 +10,41 @@ import 'playback_candidate_source.dart';
 
 typedef LinuxPlaybackBackendRegistration = void Function();
 
+/// The libmpv properties Linthra always applies on Linux.
+///
+/// media_kit turns mpv's on-disk demuxer cache on for every player it creates
+/// (`'cache-on-disk': 'yes'` in media_kit 1.2.6,
+/// `lib/src/player/native/player/real.dart`). That is a reasonable default for
+/// a video player buffering gigabytes to disk, and the wrong one here: Linthra
+/// streams audio, and it manages its own offline downloads separately. When mpv
+/// cannot create the temporary file it wants, libmpv logs
+/// `[lavf] Failed to create cache temporary file.` followed by
+/// `[lavf] Failed to create file cache.` on every stream (#405).
+///
+/// `cache-on-disk=no` turns off exactly that temporary on-disk packet file.
+/// media_kit's `cache=yes` is deliberately left alone, so normal memory and
+/// network buffering are unchanged, as is Linthra's own download/offline cache.
+///
+/// Ordering is what makes this work: media_kit applies its own defaults while
+/// the player initializes, and just_audio_media_kit applies this map afterwards
+/// through `NativePlayer.setProperty`, which awaits that initialization. The
+/// override therefore lands last.
+const Map<String, String> linuxMpvProperties = <String, String>{
+  'cache-on-disk': 'no',
+};
+
+/// [linuxMpvProperties] with anything a caller already configured layered on
+/// top.
+///
+/// Two callers configure something. The headless audio smoke sets its own `ao`
+/// before it builds a controller (`tool/linux_audio_backend_smoke.dart`), and
+/// `LinuxAudioOutputDeviceService` sets `audio-device` when the listener picks
+/// an output. Merging rather than assigning keeps both working whichever order
+/// they land in — and keeps the smoke honest: it exercises the same cache
+/// configuration production uses, with only the output device swapped.
+Map<String, String> resolveLinuxMpvProperties(Map<String, String> configured) =>
+    <String, String>{...linuxMpvProperties, ...configured};
+
 /// Registers just_audio's Linux implementation once for this process.
 ///
 /// Registration is synchronous, so the success flag cannot race another call
@@ -31,6 +66,8 @@ class LinuxPlaybackBackendInitializer {
 
   static void _registerDefaultBackend() {
     JustAudioMediaKit.title = 'Linthra';
+    JustAudioMediaKit.mpvProperties =
+        resolveLinuxMpvProperties(JustAudioMediaKit.mpvProperties);
     JustAudioMediaKit.ensureInitialized(linux: true, windows: false);
   }
 }

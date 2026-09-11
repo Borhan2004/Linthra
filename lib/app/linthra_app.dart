@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/app_info.dart';
+import '../core/lifecycle/app_visibility.dart';
 import '../core/lifecycle/platform_shutdown_policy.dart';
 import '../core/platform/host_platform.dart';
 import '../core/services/active_playback_controller.dart';
@@ -13,15 +14,19 @@ import '../data/repositories/host_platform_provider.dart';
 import '../features/appearance/app_icon_controller.dart';
 import '../features/appearance/custom_brand_palette.dart';
 import '../features/appearance/custom_theme_controller.dart';
+import '../features/appearance/desktop_density_controller.dart';
 import '../features/appearance/selected_logo_mark.dart';
 import '../features/appearance/theme_mode_controller.dart';
 import '../features/library/remote_library_refresher.dart';
 import '../features/onboarding/onboarding_controller.dart';
 import '../features/player/player_providers.dart';
+import '../features/settings/desktop/desktop_window_providers.dart';
+import '../features/settings/jellyfin/jellyfin_availability_controller.dart';
 import '../features/support/support_actions_provider.dart';
 import '../features/support/supporter_entitlement.dart';
 import 'application_lifecycle.dart';
 import 'brand_theme.dart';
+import 'quick_search_shortcuts.dart';
 import 'router.dart';
 import 'theme.dart';
 
@@ -105,22 +110,40 @@ class _LinthraAppState extends ConsumerState<LinthraApp>
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.hidden ||
         state == AppLifecycleState.inactive) {
+      if (state != AppLifecycleState.inactive) {
+        // The UI is off screen. Background work that only serves the visible UI
+        // stands down here — with playback keeping the isolate alive, a poll
+        // nobody can see is a pure wake-up. Playback itself is untouched.
+        ref.read(appVisibilityProvider.notifier).onHidden();
+      }
       final controller = ref.read(playbackControllerProvider);
       StabilityDiagnostics.backgroundPlaybackState(
           controller.state.status.name);
       // Arm suspend recovery only on a true pause (system sleep / window
       // background). Brief `inactive` (dialogs, focus blips) must not reload.
+      //
+      // A desktop window hidden by a close (#401) is the one pause that must
+      // not arm it: playback never stopped, the audio device was never taken
+      // away, and reloading the track when the window comes back would be an
+      // audible skip in music the listener kept playing on purpose.
       if (state == AppLifecycleState.paused &&
-          controller is ActivePlaybackController) {
+          controller is ActivePlaybackController &&
+          !ref.read(desktopWindowLifecycleServiceProvider).isWindowHidden) {
         controller.onAppBackgrounded();
       }
     }
     if (state == AppLifecycleState.resumed) {
+      ref.read(appVisibilityProvider.notifier).onShown();
       final controller = ref.read(playbackControllerProvider);
       if (controller is ActivePlaybackController) {
         controller.onAppResumed();
       }
       ref.read(remoteLibraryRefresherProvider).refresh();
+      // Re-probe the configured music server: coming back to the app is the
+      // moment a LAN server the user walked away from is most likely reachable
+      // again. Requirement of #536 — the library restores itself, with no
+      // reconnect and no rescan, because nothing was removed to begin with.
+      unawaited(ref.read(jellyfinAvailabilityProvider.notifier).refresh());
     }
     if (state == AppLifecycleState.detached) {
       // Desktop only. On Android `detached` also fires when the Activity is
@@ -153,8 +176,23 @@ class _LinthraAppState extends ConsumerState<LinthraApp>
       return BrandPalettes.byId(variant.id, brightness: brightness);
     }
 
-    final ThemeData lightTheme = AppTheme.light(paletteFor(Brightness.light));
-    final ThemeData darkTheme = AppTheme.dark(paletteFor(Brightness.dark));
+    // Desktop density (#395). Watched here rather than read deeper down so a
+    // change repaints and relaids out every screen at once, the same way the
+    // theme mode does — no restart, and no widget needing to know the
+    // preference exists.
+    //
+    // Resolved to null off desktop: a touch build keeps
+    // `VisualDensity.adaptivePlatformDensity` exactly as before, so an Android
+    // phone can never inherit a density someone picked for a Linux window (the
+    // preference is per-install, and Android does not show the picker at all).
+    final VisualDensity? density = ref.watch(hostPlatformProvider).isDesktop
+        ? ref.watch(desktopDensityControllerProvider).visualDensity
+        : null;
+
+    final ThemeData lightTheme =
+        AppTheme.light(paletteFor(Brightness.light), density: density);
+    final ThemeData darkTheme =
+        AppTheme.dark(paletteFor(Brightness.dark), density: density);
 
     // Do not construct the router until first-install/update state is known.
     // This tiny branded launch surface prevents both a library→welcome flash and
@@ -184,6 +222,15 @@ class _LinthraAppState extends ConsumerState<LinthraApp>
       darkTheme: darkTheme,
       themeMode: themeMode.materialThemeMode,
       routerConfig: router,
+      // Keyboard shortcuts wrap the router rather than living inside the
+      // navigation shell. Key events travel up from whatever holds focus, so a
+      // binding under the shell would be invisible to routes pushed over it —
+      // Now Playing above all, which is where opening a song from quick search
+      // lands you. Here every route is a descendant.
+      builder: (BuildContext context, Widget? child) => QuickSearchShortcuts(
+        navigatorKey: ref.watch(rootNavigatorKeyProvider),
+        child: child ?? const SizedBox.shrink(),
+      ),
     );
   }
 }

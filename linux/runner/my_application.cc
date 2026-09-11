@@ -6,6 +6,9 @@
 #endif
 
 #include "flutter/generated_plugin_registrant.h"
+#include "folder_picker_channel.h"
+#include "window_lifecycle_channel.h"
+#include "window_state_store.h"
 
 // The user-visible application name. Kept as one constant so the header bar,
 // the fallback title bar, and anything added later can never drift apart — and
@@ -27,6 +30,18 @@ static constexpr int kMinimumWindowHeight = 600;
 struct _MyApplication {
   GtkApplication parent_instance;
   char** dart_entrypoint_arguments;
+  // The GTK/portal folder chooser Dart asks for a music folder (#438). Owned
+  // here because it needs the application's own window as the dialog parent,
+  // which a plugin registrant does not have.
+  FolderPickerChannel* folder_picker;
+  // What closing the window does (#401), and the only thing that knows whether
+  // a window still exists. Owned here for the same reason: it is the
+  // application's own window it manages.
+  WindowLifecycleChannel* window_lifecycle;
+  // Remembers the window's size, maximized state and position across restarts
+  // (#383). Owned here so it outlives the window and can still be written on
+  // shutdown, after GtkApplication has destroyed the window itself.
+  WindowStateStore* window_state;
 };
 
 G_DEFINE_TYPE(MyApplication, my_application, GTK_TYPE_APPLICATION)
@@ -39,6 +54,17 @@ static void first_frame_cb(MyApplication* self, FlView* view) {
 // Implements GApplication::activate.
 static void my_application_activate(GApplication* application) {
   MyApplication* self = MY_APPLICATION(application);
+
+  // Already running: present the window we have instead of building a second
+  // one. This is the path a launcher click takes while Linthra is playing in
+  // the background with its window hidden (#401) - the runner is
+  // single-instance, so GTK hands that click to this process as an
+  // activation, and the answer to it is "here is your window back", never a
+  // duplicate app.
+  if (window_lifecycle_channel_present(self->window_lifecycle)) {
+    return;
+  }
+
   GtkWindow* window =
       GTK_WINDOW(gtk_application_window_new(GTK_APPLICATION(application)));
 
@@ -69,17 +95,31 @@ static void my_application_activate(GApplication* application) {
     gtk_window_set_title(window, kApplicationName);
   }
 
-  gtk_window_set_default_size(window, kDefaultWindowWidth,
-                              kDefaultWindowHeight);
-
-  // Floor the window at a size the current (phone-first) Flutter layout can
-  // still render without overflowing. Linthra's desktop layout lands in a later
-  // PR; until then this keeps a dragged-narrow window usable for development
-  // rather than letting it collapse into a wall of overflow errors.
+  // Floor the window at a size the shared layout can still render without
+  // overflowing. Set before the state is restored, so a saved size below the
+  // floor is clamped by the same rule a dragged one is.
   GdkGeometry geometry;
   geometry.min_width = kMinimumWindowWidth;
   geometry.min_height = kMinimumWindowHeight;
   gtk_window_set_geometry_hints(window, nullptr, &geometry, GDK_HINT_MIN_SIZE);
+
+  // Restore the remembered geometry, falling back to the opening default above
+  // on a first launch or an unusable saved state. Before the window is shown
+  // (first_frame_cb does that), so a restored window is drawn at its size
+  // rather than resizing in front of the user.
+  //
+  // A store from a previous window is written out and dropped first. Reaching
+  // here twice means the last window was destroyed and this activation is
+  // building another (#401's hide-on-close keeps the window alive instead, so
+  // it does not take this path), and a store still tracking a dead window
+  // would be both a leak and the wrong geometry to save at shutdown.
+  if (self->window_state != nullptr) {
+    window_state_store_save(self->window_state);
+    g_clear_pointer(&self->window_state, window_state_store_free);
+  }
+  self->window_state =
+      window_state_store_new(window, kMinimumWindowWidth, kMinimumWindowHeight,
+                             kDefaultWindowWidth, kDefaultWindowHeight);
 
   g_autoptr(FlDartProject) project = fl_dart_project_new();
   fl_dart_project_set_dart_entrypoint_arguments(
@@ -101,6 +141,18 @@ static void my_application_activate(GApplication* application) {
   gtk_widget_realize(GTK_WIDGET(view));
 
   fl_register_plugins(FL_PLUGIN_REGISTRY(view));
+
+  // Registered alongside the plugins, on the same engine: the folder chooser
+  // is Linthra's own channel rather than a plugin, so that a Flatpak build
+  // gets the xdg-desktop-portal chooser instead of `file_picker`'s
+  // zenity/kdialog, which the sandbox does not contain. See
+  // folder_picker_channel.h.
+  self->folder_picker = folder_picker_channel_new(view, window);
+
+  // Registered on the same engine, and for the same reason: closing this
+  // window is the application's own decision to make, and only the runner can
+  // answer a GTK delete-event in time. See window_lifecycle_channel.h.
+  self->window_lifecycle = window_lifecycle_channel_new(view, window);
 
   gtk_widget_grab_focus(GTK_WIDGET(view));
 }
@@ -130,16 +182,63 @@ static gboolean my_application_local_command_line(GApplication* application,
 static void my_application_startup(GApplication* application) {
   // MyApplication* self = MY_APPLICATION(object);
 
-  // Perform any actions required at application startup.
-
+  // Chain up first. GtkApplication::startup is what calls gtk_init(), and
+  // gtk_init() reaches gdk_pre_parse(), which unconditionally resets GDK's
+  // program class from g_get_prgname(). Anything set below before this line
+  // would be silently overwritten, so the order here is part of the fix rather
+  // than a style choice.
   G_APPLICATION_CLASS(my_application_parent_class)->startup(application);
+
+  // === Desktop identity (#554) ===
+  //
+  // Several different names leave this process, and a desktop only groups the
+  // running window under the installed launcher when they all agree with
+  // io.github.thezupzup.linthra: the id of the desktop entry, the icon, the
+  // AppStream component and the Flatpak. Each one below is derived from
+  // APPLICATION_ID (linux/CMakeLists.txt) rather than written out again, so
+  // there is no second copy of the id that can drift.
+  // scripts/check_linux_runner.py enforces the calls and this ordering.
+  //
+  // The Wayland half is already handled in my_application_new(): GTK 3 sends
+  // xdg_toplevel.set_app_id() from g_get_prgname().
+
+  // The human-readable name. Without it, g_get_application_name() falls back to
+  // g_get_prgname(), which my_application_new() has deliberately set to the
+  // reverse-DNS id, so portal dialogs and GTK's own "application is not
+  // responding" prompt would say "io.github.thezupzup.linthra" at the user.
+  g_set_application_name(kApplicationName);
+
+  // X11, including XWayland under the Flatpak's --socket=fallback-x11. GTK
+  // stamps WM_CLASS from g_get_prgname() and gdk_get_program_class() when each
+  // GtkWindow is constructed, and the class half defaults to the program name
+  // with its first letter upper-cased ("Io.github.thezupzup.linthra"), which is
+  // not a string any launcher indexes. Shells that lower-case as a fallback
+  // still find us; ones that compare exactly do not, and the window then drops
+  // out of its launcher group. Setting the class explicitly makes both halves
+  // of WM_CLASS the application id, which is also what the desktop entry's
+  // StartupWMClass= declares.
+  gdk_set_program_class(APPLICATION_ID);
+
+  // The themed window icon. GTK never sets one by itself, so the window carried
+  // no _NET_WM_ICON at all and every task switcher, panel and window list that
+  // reads the window's own icon instead of resolving a desktop entry fell back
+  // to a generic placeholder. This resolves
+  // hicolor/scalable/apps/io.github.thezupzup.linthra.svg, the icon the Flatpak
+  // installs from tool/branding/linthra_icon.svg, through the ordinary icon
+  // theme lookup: it works wherever the icon is installed and is a harmless
+  // no-op where it is not. Wayland has no window-icon protocol and keeps
+  // resolving the same file from the app id instead.
+  gtk_window_set_default_icon_name(APPLICATION_ID);
 }
 
 // Implements GApplication::shutdown.
 static void my_application_shutdown(GApplication* application) {
-  // MyApplication* self = MY_APPLICATION(object);
+  MyApplication* self = MY_APPLICATION(application);
 
-  // Perform any actions required at application shutdown.
+  // Last chance to write the window geometry: the window itself is already
+  // gone by now, which is why the store tracks the geometry rather than reading
+  // it back off the window here.
+  window_state_store_save(self->window_state);
 
   G_APPLICATION_CLASS(my_application_parent_class)->shutdown(application);
 }
@@ -148,6 +247,9 @@ static void my_application_shutdown(GApplication* application) {
 static void my_application_dispose(GObject* object) {
   MyApplication* self = MY_APPLICATION(object);
   g_clear_pointer(&self->dart_entrypoint_arguments, g_strfreev);
+  g_clear_pointer(&self->folder_picker, folder_picker_channel_free);
+  g_clear_pointer(&self->window_lifecycle, window_lifecycle_channel_free);
+  g_clear_pointer(&self->window_state, window_state_store_free);
   G_OBJECT_CLASS(my_application_parent_class)->dispose(object);
 }
 
@@ -167,9 +269,32 @@ MyApplication* my_application_new() {
   // like GTK and desktop environments map this running application to its
   // corresponding .desktop file. This ensures better integration by allowing
   // the application to be recognized beyond its binary name.
+  //
+  // Concretely (#554): this is the Wayland half of the identity. GTK 3 sends
+  // xdg_toplevel.set_app_id() straight from g_get_prgname(), so this call is
+  // what makes GNOME and KDE Plasma resolve the running window to
+  // io.github.thezupzup.linthra.desktop under Wayland. It also supplies the
+  // instance half of X11's WM_CLASS; my_application_startup() sets the class
+  // half, which GDK would otherwise derive from this name.
+  //
+  // It has to happen before gtk_init(), which GtkApplication::startup calls,
+  // because GDK reads the program name there.
   g_set_prgname(APPLICATION_ID);
 
+  // Single instance, deliberately (#401). Launching Linthra while it is
+  // already running has to reach the window that exists rather than start a
+  // second process: two of them would mean two audio engines, two MPRIS names
+  // and two connections to the same SQLite catalog. GTK forwards the second
+  // launch to this one as an activation, and my_application_activate() answers
+  // it by presenting the window - including when a close had hidden it and
+  // there is nothing else on screen to click.
+  //
+  // The flags value is spelled as a cast rather than named: G_APPLICATION_NONE
+  // is deprecated from GLib 2.74 (which -Werror turns into a build failure) and
+  // its replacement G_APPLICATION_DEFAULT_FLAGS does not exist before it, so
+  // neither name builds everywhere Linthra is built.
   return MY_APPLICATION(g_object_new(my_application_get_type(),
                                      "application-id", APPLICATION_ID, "flags",
-                                     G_APPLICATION_NON_UNIQUE, nullptr));
+                                     static_cast<GApplicationFlags>(0),
+                                     nullptr));
 }

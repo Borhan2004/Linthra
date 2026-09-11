@@ -10,13 +10,42 @@ There are two equivalent entry points; both end up at the same place:
 
 - **Settings ▸ Local music** — the primary home, grouped with the other music
   sources (Jellyfin, Navidrome / Subsonic). Choose a folder, **Rescan** it after
-  you add files, **Change** it, or **Forget** it.
+  you add files, **Add a folder** (desktop) or **Change** it (Android), remove a
+  single folder with the ✕ beside it, or **Forget** the whole local source.
 - **Library ▸ (empty state) ▸ Select / Change folder** — the same pick-and-scan
   flow, offered where you first notice an empty library.
 
-When you pick a folder, Android shows its system folder chooser. Linthra keeps
-**only** the access you grant for that one folder — no broad "all files" or media
-permission is requested.
+When you pick a folder, the system's own folder chooser opens — Android's on a
+phone, the desktop's on Linux. Linthra keeps **only** the access you grant for
+that one folder; it never asks for a broad "all files" or media permission, and
+on Linux it needs no host filesystem permission at all (see
+[On Linux](#on-linux-including-the-flatpak)).
+
+## Several folders (desktop)
+
+On Linux a library is often spread around — an internal music folder, an
+external drive, a NAS mount — so **Settings ▸ Local music** takes as many folders
+as you like and scans them as one library. Android keeps a single selection: its
+local access is one Storage Access Framework grant (or the device-wide MediaStore
+mode) at a time.
+
+What that means in practice:
+
+- **Overlapping folders import a file once.** Selecting `~/Music` and then
+  `~/Music/Live sets` is not an error and does not duplicate anything: the inner
+  folder is already covered, so only `~/Music` is walked. Adding a folder that
+  contains ones you already selected replaces them, again keeping one walk.
+- **An offline folder doesn't take the rest down.** If a drive is unplugged
+  when you rescan, the folders Linthra *can* read are refreshed and the offline
+  one keeps the tracks it already contributed. The card says how many folders
+  couldn't be read, and the library is not silently shortened. If **no** folder
+  can be read, nothing is written at all — the catalog stays exactly as it was.
+- **Removing a folder removes only its music.** The ✕ beside a folder drops it
+  and rescans the rest, so the other folders' tracks stay indexed. Removing the
+  last folder is the same as Forget: the local index is emptied, and nothing on
+  disk is touched.
+- **The selection survives restarts**, and an existing single-folder library is
+  carried over untouched — it simply becomes the first folder in the list.
 
 ## What's supported
 
@@ -74,11 +103,120 @@ read a user-chosen folder is the **Storage Access Framework (SAF)**:
    descending into subfolders. One unreadable subfolder is skipped and counted,
    not fatal; a totally unreadable selected folder surfaces a clear error rather
    than a silent empty result.
+4. That walk runs **off the platform (main) thread**, on `PlatformChannelWorker`'s
+   single background thread, and the method-channel reply is encoded and sent
+   there too. A real library means thousands of
+   content-resolver queries plus a `MediaMetadataRetriever` open per file, so
+   scanning inline would freeze the UI and eventually trip an ANR. Two scans
+   never run at once. Picking a second folder mid-scan **supersedes** the first
+   rather than queueing behind it: the abandoned walk stops at its next file and
+   answers `saf_superseded`, so the folder you just chose starts right away
+   instead of waiting out a scan you already moved on from. Forgetting the
+   folder or switching to the device-wide library cancels it the same way, even
+   though neither starts a replacement scan. That flag is process-scoped, so it
+   keeps working if Android recreates the activity mid-scan. `scripts/check_android_channel_threading.py` guards both the thread
+   boundary and the cancellation, because a walk that drifts back onto the
+   platform thread, or a supersede that quietly stops superseding, still
+   compiles and still passes every test.
 
 This is why a raw path like `/storage/emulated/0/Music/...` is the wrong thing to
 store — it looks fine but can't be read under scoped storage. If you selected a
 folder in a much older build and see "no music found", just **choose the folder
 again**: the new selection grants and persists proper access.
+
+### On Linux (including the Flatpak)
+
+Linux stores a real filesystem path rather than a `content://` URI, and the scan
+is an ordinary `dart:io` walk. What differs is where the path comes from:
+
+1. The folder chooser is GTK's own (`GtkFileChooserNative`, opened by Linthra's
+   Linux runner). On a native build that is the familiar in-process dialog.
+2. Inside the **Flatpak**, GTK routes exactly the same chooser to
+   **xdg-desktop-portal**, which runs it on the host. Only the folder you picked
+   is handed back to the sandbox, exported through the document portal, and it
+   stays readable after a restart. Nothing else on the host becomes visible, and
+   Linthra ships no `--filesystem=host` or `--filesystem=home` permission — see
+   [`flatpak/README.md`](../flatpak/README.md#local-music-folders).
+3. If a folder later stops resolving — an unplugged drive, a folder you moved
+   or deleted, or a portal grant you revoked — Linthra says so, on that folder's
+   own row, and asks you to select it again. It does **not** treat that as "this
+   folder is empty now", so its music stays indexed until you choose, and the
+   other folders keep scanning normally.
+4. **Tags are read from the files themselves**, not guessed from their names:
+   title, artist, album artist, album, track number and duration, from ID3
+   (MP3), Vorbis comments (FLAC, OGG, Opus), MP4 atoms (M4A), APEv2 and RIFF
+   INFO (WAV). Only the tag structures are parsed, so a 60 MB FLAC is not read
+   into memory to find its title. A file with no tags, or one that cannot be
+   parsed, still appears in the library with its filename-derived name — a
+   track is never dropped for having bad tags.
+
+   Two honest gaps on Linux today: **embedded cover art is not extracted yet**
+   ([#408](https://github.com/thezupzup/linthra/issues/408)), so local tracks
+   keep the placeholder; and **album artist** depends on the container. ID3
+   (TPE2), APEv2 and FLAC report a real one, so a compilation groups under the
+   album artist. OGG and Opus do not: the tag reader Linthra uses folds their
+   `ARTIST` and `ALBUMARTIST` comments into one list and loses which was which,
+   and guessing would be worse than reporting none, so those group by album and
+   artist instead. FLAC avoids that because Linthra reads its comment block
+   itself and keeps the field names.
+
+## When files move or disappear
+
+Your music folder is yours, and Linthra assumes you will reorganise it. A
+rescan is what brings the library back in step, and it follows three rules.
+
+**A file that is really gone leaves the library.** If a folder was read fine
+and a file it used to hold is not in it any more, the track is dropped from the
+index. Nothing is deleted from disk: the file was already gone, and Linthra never
+removes or moves your audio, on a rescan or at any other time.
+
+**A folder that could not be read changes nothing.** An unplugged drive, a
+network mount that is down, a revoked portal document: none of those are
+deletions, and none of them are treated as one. That folder's tracks stay
+indexed exactly as they were while the folders Linthra *can* read are
+refreshed. If no folder at all can be read, nothing is written.
+
+**A file that moved keeps its history, when that can be proven.** Local tracks
+are identified by their path, so moving one would normally reset its play
+count, un-heart it, and make a five-year-old rip look newly added. Linthra
+avoids that by matching a file that vanished against a file that appeared,
+using the **tags read out of the file** (exact duration, title, artist, album,
+album artist, track number), and never the file name.
+
+The matching is deliberately cautious, and gives up rather than guessing:
+
+- a file whose tags could not be read is never matched, because its title and
+  artist/album came from the file name and folders and matching on those is
+  matching the path in disguise;
+- if two files that disappeared share the same tags, or two that appeared do,
+  the match is ambiguous and nothing is claimed, because copying an album is not the
+  same as moving it;
+- a file that was re-encoded or re-tagged no longer matches, so it is simply
+  treated as a new track.
+
+Every one of those falls back to the same safe result: the old path counts as
+removed, the new one as a new track, and no listening history changes hands.
+It is better to lose a play count than to hand one song's history to another.
+
+**If the file that is playing disappears**, playback stops on that track with a
+message saying so, and the queue is left exactly as it is: the track keeps its
+place and skipping past it works normally.
+
+### What this cannot see
+
+Rescans compare what is on disk against what Linthra last indexed, so:
+
+- **Between rescans the library can be stale.** Filesystem watching
+  ([#409](https://github.com/thezupzup/linthra/issues/409)) is what closes that
+  gap.
+- **Hardlinks and bind mounts** make one file visible at two paths. Linthra
+  imports it once (per selected folder) and cannot tell such a pair apart from
+  a genuine copy, so it treats it as one.
+- **A file moved *out of* a folder Linthra can read into one it cannot** (an
+  offline drive) looks like a deletion, because the destination was never
+  scanned. Rescanning with the drive connected brings it back.
+- **Moving a file while it plays** is not noticed until the next rescan or the
+  next time that track is loaded.
 
 ## Local music vs Offline downloads vs Cache
 
@@ -86,7 +224,7 @@ These three are easy to confuse but are distinct:
 
 | Concept | What it is | Where |
 | --- | --- | --- |
-| **Local music** | Music files that already live on the device or SD card, played in place from a folder you chose via SAF. Linthra never moves or copies them. | Settings ▸ Local music |
+| **Local music** | Music files that already live on the device, SD card or computer, played in place from a folder you chose in the system chooser (SAF on Android, the desktop/portal chooser on Linux). Linthra never moves or copies them. | Settings ▸ Local music |
 | **Offline downloads** | Copies Linthra makes of **server** tracks (Jellyfin / Subsonic) so they play without a network. You choose what to download. | The download action / Settings ▸ Offline |
 | **Cache** | Linthra-managed **temporary** storage (e.g. streamed/pre-cached audio), bounded by a size limit and reclaimable at any time. | Settings ▸ Cache — see [offline-cache.md](./offline-cache.md) |
 
@@ -99,11 +237,14 @@ folder brings them back.
 Settings ▸ Diagnostics (and the "Report a bug" flow) include **secret-free** scan
 counters — counts only, never a path, file name, or URI:
 
-- **Local folder**: selected / not selected
-- **Local folder access**: persisted / not persisted (the SAF grant — the
-  removable-SD-card-after-reboot signal)
+- **Local folder**: selected / not selected (how many folders is reported by the
+  scan line below, never which ones)
+- **Local folder access**: persisted / not persisted (on Android the SAF grant —
+  the removable-SD-card-after-reboot signal; on Linux whether the chosen folder
+  can still be listed at all)
 - **Local scan**: files visited, folders visited, audio candidates, imported,
-  skipped (unsupported), read failures
+  skipped (unsupported), read failures, and — for a multi-folder library — how
+  many selected folders were scanned and how many were unreachable
 - **Local scan recursive**: yes / no
 - **Local supported types**: the extensions Linthra accepts
 - **Local scan status**: ok, or the failure kind
@@ -117,7 +258,9 @@ Reading them:
 - `audio 0, skipped N` means files were found but none matched a supported audio
   type.
 - `access: not persisted` after a reboot means the SD-card grant was lost —
-  re-select the folder.
+  re-select the folder. On Linux the same line means the folder no longer
+  resolves (drive not connected, folder moved, portal access revoked); the
+  library you already indexed is kept, so re-selecting restores it.
 
 Please don't paste full private paths into public bug reports; the diagnostics
 above are designed so you don't have to.

@@ -50,19 +50,86 @@ finish-args:
   # so --socket=pulseaudio is what reaches both a native PulseAudio session
   # and a PipeWire one — there is no separate "--socket=pipewire" finish-arg.
   - --socket=pulseaudio
+  # User-configured Jellyfin, Navidrome/Subsonic and Plex servers are ordinary
+  # HTTP(S) destinations. Flatpak disables all networking unless this single
+  # capability is granted; --share=network enables normal sockets (including
+  # LAN addresses, DNS hostnames and remote/tunnel endpoints) without exposing
+  # host files or adding a D-Bus permission. Provider discovery remains out of
+  # scope: direct configured endpoints need no discovery-specific grant.
+  - --share=network
+  #
+  # MPRIS (#397). The Linux media session is a D-Bus object Linthra exports and
+  # a well-known name it owns, so a desktop shell can find and drive it. Inside
+  # the sandbox that name has to be granted: Flatpak lets an app own names under
+  # its own application id, and `org.mpris.MediaPlayer2.linthra` is not one of
+  # those.
+  #
+  # These two grants are the narrowest form that works. --own-name is not
+  # --talk-name: owning a name lets other clients call Linthra, and gives
+  # Linthra no way to call anything. Both are scoped to Linthra's own player
+  # names, so no other player's MPRIS interface becomes reachable — which
+  # --socket=session-bus, or an `org.mpris.MediaPlayer2.*` wildcard, would both
+  # do. The second line covers the spec's `.instance<pid>` fallback, used when a
+  # second Linthra window finds the plain name already taken.
+  - --own-name=org.mpris.MediaPlayer2.linthra
+  - --own-name=org.mpris.MediaPlayer2.linthra.*
+  #
+  # Secure credential storage (#441) needs nothing here either, for the same
+  # reason local music folders don't: the sandbox path is a portal.
+  # flutter_secure_storage's Linux implementation
+  # (flutter_secure_storage_linux 1.2.3) is a thin wrapper over libsecret,
+  # which chooses its own backend at runtime (secret-backend.c,
+  # backend_get_impl_type): when /.flatpak-info exists and xdg-desktop-portal
+  # answers org.freedesktop.portal.Secret v1, it uses its file backend, an
+  # encrypted store under the app's own data dir whose master secret is handed
+  # over by the portal (and held by the host's keyring). Every Flatpak may talk
+  # to the portal, so no finish-arg grants it.
+  #
+  # That portal is exported only when the desktop ships an
+  # org.freedesktop.impl.portal.Secret backend (xdg-desktop-portal
+  # desktop-portal/secret.c, init_secret: no impl configured means the
+  # interface is never exported). Both desktops this targets do:
+  #   * GNOME, via gnome-keyring (daemon/dbus/gkd-secret-portal.c).
+  #   * KDE Plasma 6, via KWallet's ksecretd
+  #     (src/runtime/ksecretd/kwalletportalsecrets.cpp, which installs
+  #     org.freedesktop.impl.portal.desktop.kwallet.service and
+  #     kwallet.portal). KF6 only; the KF5 kwalletd had no portal backend.
+  # org.gnome.Platform//50 carries libsecret 0.21.7 built with libgcrypt
+  # (freedesktop-sdk 25.08 elements/components/libsecret.bst), so that file
+  # backend is compiled in and the sandbox detection above is live.
+  #
+  # So --talk-name=org.freedesktop.secrets is deliberately NOT granted. On a
+  # host with no Secret portal backend (a KF5-era KDE, a bare WM running only
+  # a Secret Service daemon) libsecret falls back to the Secret Service bus
+  # name, the sandbox's D-Bus proxy hides it, and Linthra reports a
+  # recoverable storage error and stays signed out rather than falling back to
+  # any storage of its own. A user who wants that fallback can grant it
+  # themselves with `flatpak override --user`; it is not worth a permission on
+  # every install (docs/flatpak-development.md "Secure credential storage").
+  #
+  # Local music folders (#438) need nothing here on purpose. Linthra's Linux
+  # runner opens GTK's GtkFileChooserNative, which GTK routes to the
+  # xdg-desktop-portal FileChooser inside a sandbox — every app may talk to the
+  # portal, so no finish-arg grants it. The folder the user picks comes back
+  # through the document portal (already mounted for every Flatpak) as a path
+  # under the app's own document store, which is readable *because* the user
+  # chose it and stays readable across restarts. Nothing else on the host
+  # becomes visible, which is exactly what a --filesystem grant could not
+  # promise.
   #
   # Deliberately withheld for issue #432, still withheld here (see
   # flatpak/README.md "What's deferred" for the reasoning):
-  #   --share=network            (provider streaming: #440. #433 only proves
-  #                                the bundled runtime *can* play HTTP(S)
-  #                                audio, using a temporary, non-committed
-  #                                `flatpak override` for that validation —
-  #                                see flatpak/README.md.)
-  #   --filesystem=host/home     (broad filesystem access: #438/#439)
-  #   --talk-name=org.freedesktop.secrets  (Secret Service: #441)
-  # Their absence is safe: flutter_secure_storage/Jellyfin-Subsonic-Plex
-  # session restore on Linux treats every read/write failure as "not signed
-  # in" and keeps running (docs/linux-desktop.md "Secure storage").
+  #   --filesystem=host/home     (broad filesystem access. Not needed for the
+  #                                local library, per the portal note above;
+  #                                the remaining permission audit is #439.)
+  #   --socket=session-bus, --talk-name=org.freedesktop.secrets, and every
+  #                                wildcard or --own-name form of it (#441
+  #                                is served by the Secret portal instead,
+  #                                per the note above).
+  # Their absence is safe: secure storage that is missing, locked or denied
+  # surfaces as a recoverable sign-in/storage error and Jellyfin/Subsonic/Plex
+  # stay signed out. Linthra never writes a credential to storage of its own,
+  # in plaintext or otherwise (docs/linux-desktop.md "Secure storage").
 
 modules:
   # === Self-contained libmpv audio runtime, built from pinned upstream source
@@ -143,6 +210,18 @@ modules:
   - name: libplacebo
     buildsystem: meson
     config-opts:
+      # Pin the install layout. flatpak-builder passes meson only --prefix=/app,
+      # and meson then resolves its *own* default libdir, which is `lib64`
+      # inside this SDK because the freedesktop base image carries a real
+      # /usr/lib64 directory. That puts libplacebo.so and libplacebo.pc in
+      # /app/lib64, which is on neither of the two paths that matter:
+      # flatpak-builder's PKG_CONFIG_PATH (so the mpv module below fails its
+      # `Dependency "libplacebo" not found` check) nor the sandbox's runtime
+      # library path. The autotools modules here already land in /app/lib
+      # because flatpak-builder passes them --libdir=/app/lib; this pins the
+      # meson ones to the same place, which is also what flatpak/README.md
+      # documents ("installed under /app/lib").
+      - -Dlibdir=lib
       - -Dvulkan=enabled
       - -Dshaderc=disabled
       - -Dglslang=disabled
@@ -182,6 +261,11 @@ modules:
   - name: mpv
     buildsystem: meson
     config-opts:
+      # Same meson libdir pin as libplacebo above, and it matters more here:
+      # media_kit/just_audio_media_kit dlopen this libmpv by soname at startup,
+      # so it has to sit on the sandbox's library path rather than in
+      # /app/lib64.
+      - -Dlibdir=lib
       # Only libmpv is needed; the mpv CLI player pulls in scripting, disc
       # and gamepad stacks Linthra never touches.
       - -Dcplayer=false
@@ -274,18 +358,46 @@ modules:
       # is no packaging-only duplicate to drift, exactly like the desktop entry
       # above.
       #
-      # One scalable SVG and nothing else. `hicolor` is the fallback theme every
-      # icon theme inherits from, `scalable/apps` is where an app's own
-      # resolution-independent icon belongs, and the basename *is* the icon-theme
-      # name the entry's `Icon=` looks up. A vector is sharp at every launcher
-      # size and every HiDPI scale factor by construction, so raster fallbacks
-      # would be dozens of files that can only be worse. scripts/check_linux_runner.py
-      # asserts this path, this basename and `Icon=` agree, in both manifests.
+      # `hicolor` is the fallback theme every icon theme inherits from,
+      # `scalable/apps` is where an app's own resolution-independent icon
+      # belongs, and the basename *is* the icon-theme name the entry's `Icon=`
+      # looks up. scripts/check_linux_runner.py asserts these paths, this
+      # basename and `Icon=` agree, in both manifests.
       #
       # flatpak-builder exports `/app/share/icons/hicolor/**` whose basename
       # starts with the app id at `finish` time, the same rule as the desktop
       # entry — so this needs no `rename-icon` either.
       - install -Dm644 tool/branding/linthra_icon.svg /app/share/icons/hicolor/scalable/apps/io.github.thezupzup.linthra.svg
+      # The raster half of the same icon (#436). A launcher resolves the SVG
+      # above at whatever size it likes, but the *window* icon cannot: GTK
+      # builds X11's `_NET_WM_ICON` by asking gdk-pixbuf to decode what the
+      # icon theme hands it, and gdk-pixbuf has no SVG loader of its own —
+      # librsvg's pixbuf module is obsolete and its replacement (glycin) is not
+      # wired into GTK 3's icon-theme path in org.gnome.Platform. With only a
+      # scalable icon installed the lookup produces nothing, GTK sets no icon
+      # list at all, and the window ships with no `_NET_WM_ICON` for panels,
+      # task switchers and window lists to read — which is exactly what
+      # scripts/flatpak_launch_smoke.sh caught. PNG is decoded by a loader built
+      # into gdk-pixbuf itself, so these always resolve, and GTK prefers an
+      # exact fixed-size match over a scalable one, so nothing else changes.
+      #
+      # Rasterised from the same source design by tool/branding/generate_icons.py
+      # (`python3 tool/branding/generate_icons.py`), like the Android launcher
+      # mipmaps — still no second brand mark, just a second encoding of the one.
+      - install -Dm644 linux/packaging/icons/hicolor/48x48/apps/io.github.thezupzup.linthra.png /app/share/icons/hicolor/48x48/apps/io.github.thezupzup.linthra.png
+      - install -Dm644 linux/packaging/icons/hicolor/64x64/apps/io.github.thezupzup.linthra.png /app/share/icons/hicolor/64x64/apps/io.github.thezupzup.linthra.png
+      - install -Dm644 linux/packaging/icons/hicolor/128x128/apps/io.github.thezupzup.linthra.png /app/share/icons/hicolor/128x128/apps/io.github.thezupzup.linthra.png
+      - install -Dm644 linux/packaging/icons/hicolor/256x256/apps/io.github.thezupzup.linthra.png /app/share/icons/hicolor/256x256/apps/io.github.thezupzup.linthra.png
+      # AppStream metainfo (#435). Software centres and later Flathub read
+      # `/app/share/metainfo/<app-id>.metainfo.xml`; flatpak-builder exports
+      # that directory at `finish` time under the same app-id-prefix rule as
+      # the desktop entry and the icon, so there is no `rename-appdata-file`.
+      # The file lives in linux/packaging/ next to the desktop entry so a
+      # native package installs the same listing. Claims inside it are limited
+      # to what Linux actually ships; scripts/check_linux_runner.py holds the
+      # component id, launchable and stock icon to the same sources of truth
+      # as the desktop entry.
+      - install -Dm644 linux/packaging/io.github.thezupzup.linthra.metainfo.xml /app/share/metainfo/io.github.thezupzup.linthra.metainfo.xml
     sources:
       # The app's own source. flatpak-flutter's pre-processing step cannot
       # read a `dir` source (it only fetches `git` sources to inspect

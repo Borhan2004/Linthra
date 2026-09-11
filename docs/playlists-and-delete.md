@@ -23,16 +23,84 @@ What you can do:
   detail screen).
 - **Delete** a playlist (always behind a confirmation).
 - **Add tracks** from a track's overflow menu ("Add to playlist"), from the Now
-  Playing actions, or via multi-select.
+  Playing actions, via multi-select, or, on desktop, by dragging tracks onto a
+  playlist row (see [Dragging tracks into a playlist](#dragging-tracks-into-a-playlist)).
 - **Remove tracks** from a playlist (per-row, with an Undo snackbar, or via
   multi-select).
-- **Reorder tracks** by dragging the handle on a row.
+- **Reorder tracks** by dragging the handle on a row — see
+  [Reordering a playlist](#reordering-a-playlist).
 - **Play** the playlist, or **Shuffle** it, from the detail screen. Tapping any
   track plays from there and queues the rest of the playlist behind it.
+
+### Reordering a playlist
+
+Drag a track by the handle on its row to move it. On desktop the handle behaves
+the way a desktop control should: the pointer turns into a grab cursor over it,
+hovering shows what it does, and the row lifts onto a shadow while it is being
+dragged so you can see what you picked up.
+
+**Without a pointer.** Tab to a row's handle and press **Ctrl + ↑ / ↓** (Cmd on
+macOS) to move that row one position. Focus follows the track, so holding the
+chord walks it up or down the playlist (the list scrolls along to keep the track
+you are moving in view). The same two moves are exposed to screen readers as the
+row's **Move up** / **Move down** actions, and a row at either end only offers
+the move that goes somewhere.
+
+Drag, keyboard and screen reader all run through the same
+`PlaylistRepository.reorderTracks` call, so nothing behaves differently
+depending on how you reached it. The new order is written locally first; a
+server that refuses it leaves the local order applied and the playlist marked
+`syncFailed` rather than losing the edit (see [Sync state](#sync-state)).
+
+Reordering is offered only when every stored track resolved to something in your
+library. If some entries are missing (the "N songs are no longer in your
+library" note), the list is not reorderable at all — the visible rows no longer
+line up 1:1 with the stored order, so a drag could scramble entries you cannot
+see.
 
 Playlists persist locally via `shared_preferences` (the same lightweight,
 plugin-only storage used for favourites and the offline-download set) — no
 secrets are ever written to playlist metadata.
+
+### Dragging tracks into a playlist
+
+On desktop, pull a track row sideways to pick it up and drop it on a playlist in
+the Playlists tab. Dragging a row that is part of a multi-selection carries the
+whole selection; dragging any other row carries just that row, which is what a
+desktop list is expected to do.
+
+The library and the playlist list are different tabs, so Linthra's navigation is
+**spring-loaded**: rest a drag on it for a moment and it opens Playlists, with
+the Playlists destination highlighted so you can see where the drag is heading.
+Navigation never takes the drop itself, it only gets you to the rows. Crossing
+it quickly on the way somewhere else does nothing.
+
+This works on the rail of a wide window and on the bottom bar of a narrow one.
+A mouse is still a mouse below the desktop breakpoint, so a drag that could
+start there needs somewhere to go.
+
+The spring always opens the **playlist list**, not whatever that tab had open
+last. Favorites and the smart mixes live inside the Playlists tab and are not
+playlists you can drop onto, so restoring one of those would leave a drag on a
+page it could not finish on. Starting a drag from Favorites and resting it on
+the navigation gets you back to the list for the same reason.
+
+Only sideways drags pick a row up, so a vertical drag still scrolls the list.
+None of this exists on mobile, where a long press already starts multi-select.
+
+A drop goes through exactly the same rules as the "Add to playlist" sheet
+(`PlaylistAddPlan`), so it can never put a track somewhere the sheet would have
+refused:
+
+- a synced playlist takes only its own server's tracks, and a drop of a mixed
+  selection adds the supported half and says how many it skipped
+- a drop a playlist cannot take at all writes nothing and explains why, rather
+  than silently bouncing back
+- tracks already in the playlist are skipped, and the confirmation counts only
+  what genuinely landed
+
+Drag-and-drop is an addition, never the only way in. Every playlist edit is
+still reachable from the keyboard and the row menus.
 
 ### Sync state
 

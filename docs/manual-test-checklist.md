@@ -142,6 +142,11 @@ check in §4 #14b):
 - ☐ **Paused ≥ 30 min** (Bluetooth connected, screen off): Linthra's background CPU
   is **negligible** — confirming the position flush stopped on pause and nothing
   polls while idle. This is the key "no unnecessary polling/wake-ups" check.
+- ☐ **Screen-off playback with a Jellyfin server configured**: on the server's
+  own access log (or a proxy log), Linthra makes **no** availability probes
+  while the app is off screen — only the playback reports for a streamed track.
+  Returning to the app probes once, immediately, and the library is intact
+  either way. This is the visibility gate from issue #344.
 
 ## 3b. Server playback reporting (Now Playing on your server)
 
@@ -171,8 +176,31 @@ playback.
 
 ## 4. Cast / Chromecast
 
-Run the end-to-end pass in this order (a streamed track is required — local
-files can't cast):
+**Casting is currently contained** (see [cast.md](cast.md#temporary-containment)),
+so a shipped build has one pass, and it is the one that matters for the security
+maintenance release. Run it on a **real Android device and a real iPhone**, with a
+Chromecast powered on and on the same Wi-Fi:
+
+1. ☐ Start a **Jellyfin** (or Subsonic) track playing.
+2. ☐ Open the cast sheet: it says casting is **temporarily unavailable**, and does
+   *not* claim the platform is unsupported.
+3. ☐ **No device ever appears**, however long the sheet stays open, with a
+   powered-on Chromecast on the same network.
+4. ☐ Nothing can be tapped to connect; there is no retry or "search again".
+5. ☐ Local playback **keeps going untouched** the whole time: no pause, no
+   restart, no jump in position.
+6. ☐ Close and reopen the sheet a few times, background and foreground the app —
+   still no devices, still no interruption.
+7. ☐ The **queue, playback settings, and server sessions are unchanged** after
+   all of the above.
+8. ☐ Local files, downloads, Jellyfin, Navidrome/Subsonic and Plex playback all
+   behave normally.
+
+The end-to-end pass below applies **only once casting is restored** by the
+reviewed change that authenticates receivers. Keep it here; do not run it against
+a contained build (it will fail at step 2 by design).
+
+Run it in this order (a streamed track is required — local files can't cast):
 
 1. ☐ Start a **Jellyfin** (or Subsonic) track playing on the phone.
 2. ☐ Open the cast sheet, discover, and **connect** to a real Chromecast.
@@ -260,6 +288,27 @@ Additional cast checks:
 - ☐ The toggle persists across restart and stays in sync between the Downloads
   tab and **Settings → Downloads & network**.
 - ☐ With mobile data allowed, the **cache size limit still applies** over LTE.
+
+### Album / playlist "Download all"
+
+- ☐ An album with server tracks shows the **download** action in its app bar; an
+  all-local album does not.
+- ☐ A playlist's menu offers **Download all** on the same rule.
+- ☐ The confirmation names the exact number of songs, and **Cancel downloads
+  nothing**.
+- ☐ Confirming downloads every song; the **Downloads** screen shows the batch
+  ("Downloading <name>: N of M") with per-track rows below it.
+- ☐ **Stop** ends the batch. Songs already downloaded stay downloaded, and
+  nothing is deleted.
+- ☐ Running it again on the same album re-downloads nothing and says everything
+  is already offline.
+- ☐ On mobile data with **Allow mobile data** off, the whole album is queued
+  with the same friendly "limited to Wi-Fi" message.
+- ☐ With a small cache limit, the batch stops with the "not enough cache space"
+  message instead of evicting pinned tracks.
+- ☐ In a playlist mixing server and on-device songs, only the server ones are
+  counted in the confirmation and only they appear in Downloads.
+- ☐ Starting a second "Download all" while one runs is refused with a message.
 
 ## 7. Smart pre-cache
 
@@ -401,6 +450,23 @@ cache's knowledge survives a restart; it never holds a URL or token.
   Disable battery saver — high refresh resumes.
 - ☐ (Optional) Confirm via *Developer options ▸ Show refresh rate* that the rate
   rises to the panel's max with Linthra in the foreground.
+
+### Desktop HiDPI & fractional scaling (Linux)
+
+The scale matrix is covered by widget tests, so this pass is only about what a
+compositor does that Flutter's own layout cannot tell you. The full GNOME/KDE
+steps live in [hidpi-and-scaling.md](./hidpi-and-scaling.md); the short version:
+
+- ☐ GNOME: Library, an album, an artist and Now Playing at 100 / 125 / 150 /
+  175 / 200% display scale: nothing clipped, artwork sharp rather than soft.
+- ☐ GNOME with Large Text on, at 100% and 150%.
+- ☐ KDE Plasma: the same five scales, plus Force font DPI at 96 and 120.
+- ☐ Drag the window to its minimum size: it stops somewhere usable and the
+  layout still works there.
+- ☐ Drag the window between a HiDPI panel and an external 1080p monitor: it
+  re-renders sharply on the second screen rather than staying blurry.
+- ☐ On an ultrawide, content stays centred and capped rather than stretching a
+  track row across the whole panel.
 
 ---
 

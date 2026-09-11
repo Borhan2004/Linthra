@@ -564,13 +564,16 @@ class LocalMusicProviderCard extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final String? folder =
-        ref.watch(selectedFolderControllerProvider).valueOrNull;
+    final List<String> folders =
+        ref.watch(selectedFolderControllerProvider).valueOrNull ?? <String>[];
     final LocalScanReport? report = ref.watch(localScanReportProvider);
     final LocalMusicActionState action =
         ref.watch(localMusicControllerProvider);
-    final bool? persisted = ref.watch(localFolderAccessProvider).valueOrNull;
-    final bool hasFolder = folder != null && folder.isNotEmpty;
+    final bool accessLost = ref.watch(localFolderAccessLostProvider);
+    final bool hasFolder = folders.isNotEmpty;
+    final FolderLocation? location =
+        hasFolder ? FolderLocation.parse(folders.first) : null;
+    final bool isDeviceLibrary = location?.isAndroidMediaStore ?? false;
     final LocalMusicController controller =
         ref.read(localMusicControllerProvider.notifier);
 
@@ -582,25 +585,41 @@ class LocalMusicProviderCard extends ConsumerWidget {
     String status;
     ProviderStatusTone tone;
     String? detail;
+    final String folderLabel = folders.length > 1
+        ? '${folders.length} folders'
+        : isDeviceLibrary
+            ? 'All music on this device'
+            : location?.displayLabel ?? '';
     if (!hasFolder) {
       status = 'No folder selected';
       tone = ProviderStatusTone.neutral;
       detail = 'Pick a folder on this device to play your own music.';
-    } else if (persisted == false) {
-      status = 'Folder access lost';
+    } else if (accessLost) {
+      if (isDeviceLibrary) {
+        status = 'Device music access off';
+      } else {
+        status =
+            folders.length > 1 ? 'A folder is offline' : 'Folder access lost';
+      }
+      detail = folderLabel;
       tone = ProviderStatusTone.error;
-      detail = FolderLocation.parse(folder).displayLabel;
     } else {
       final int tracks = report?.importedTracks ?? 0;
       status = tracks > 0
           ? '$tracks ${tracks == 1 ? 'track' : 'tracks'}'
-          : 'Folder selected';
+          : isDeviceLibrary
+              ? 'Device music selected'
+              : folders.length > 1
+                  ? 'Folders selected'
+                  : 'Folder selected';
       tone = ProviderStatusTone.positive;
-      detail = FolderLocation.parse(folder).displayLabel;
+      detail = folderLabel;
     }
 
     return ProviderSummaryCard(
-      icon: Icons.folder_special_outlined,
+      icon: isDeviceLibrary
+          ? Icons.library_music_outlined
+          : Icons.folder_special_outlined,
       title: 'Local music',
       statusLabel: status,
       statusTone: tone,

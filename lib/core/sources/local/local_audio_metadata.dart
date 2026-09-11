@@ -1,5 +1,6 @@
-/// Audio tags read from an on-device item (an Android SAF document via the
-/// native content resolver, or — in a future follow-up — a desktop file).
+/// Audio tags read from an on-device item: an Android SAF document via the
+/// native content resolver, or a desktop file via
+/// `FilesystemLocalMetadataReader`.
 ///
 /// Every field is optional: a `null` value means "this source had no
 /// trustworthy value for this field", so [LocalTrackMapper] falls back to a
@@ -13,6 +14,7 @@ class LocalAudioMetadata {
     this.artist,
     this.albumArtist,
     this.album,
+    this.albumId,
     this.trackNumber,
     this.duration,
     this.artworkUri,
@@ -32,6 +34,11 @@ class LocalAudioMetadata {
 
   /// The album title (e.g. ID3 `TALB`).
   final String? album;
+
+  /// A stable, already source-namespaced album identifier when the native
+  /// source exposes one. Android MediaStore provides this even when individual
+  /// tracks in a compilation have different artist values.
+  final String? albumId;
 
   /// The 1-based track number within its album, when known.
   final int? trackNumber;
@@ -57,6 +64,7 @@ class LocalAudioMetadata {
       artist == null &&
       albumArtist == null &&
       album == null &&
+      albumId == null &&
       trackNumber == null &&
       duration == null &&
       artworkUri == null;

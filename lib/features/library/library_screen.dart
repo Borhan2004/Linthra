@@ -10,10 +10,17 @@ import '../../app/routes.dart';
 import '../../core/models/album.dart';
 import '../../core/models/artist.dart';
 import '../../core/models/track.dart';
+import '../../core/repositories/library_tab_store.dart';
 import '../../core/services/bulk_track_actions.dart';
 import '../../core/sources/local/folder_location.dart';
+import '../../data/repositories/host_platform_provider.dart';
+import '../../data/repositories/library_tab_store_provider.dart';
+import '../../shared/layout/adaptive_layout.dart';
+import '../../shared/layout/pane_layout.dart';
 import '../../shared/widgets/empty_state.dart';
 import '../playlists/widgets/add_to_playlist_sheet.dart';
+import 'album_detail_screen.dart';
+import 'artist_detail_screen.dart';
 import 'folder_browser_providers.dart';
 import 'library_browse_providers.dart';
 import 'library_controller.dart';
@@ -22,19 +29,20 @@ import 'library_state.dart';
 import 'library_sync_activity.dart';
 import 'selected_folder_controller.dart';
 import 'song_actions.dart';
+import 'track_selection.dart';
 import 'unified_library_providers.dart';
 import 'widgets/album_grid.dart';
 import 'widgets/alphabet_track_list.dart';
-import 'widgets/artist_tile.dart';
-import 'widgets/folder_browser_tab.dart';
+import 'widgets/artist_grid.dart';
 import 'widgets/library_search_field.dart';
+import 'widgets/selection_escape_scope.dart';
 
-/// Browse the catalog across Songs, Albums, Artists, and provider folders.
+/// Browse the de-duplicated catalog across Songs, Albums and Artists.
 ///
-/// The first three tabs read the de-duplicated local catalog and share one
-/// search box. Folders is an on-demand view of the real hierarchy exposed by a
-/// connected Jellyfin or Navidrome/Subsonic server, so it does not require the
-/// directory tree to be persisted or recursively synced first.
+/// All three tabs read the same local catalog and share one search box. The
+/// server's real directory hierarchy is not here: it lives on its own top-level
+/// [FoldersScreen] destination, so it keeps its place in the tree when you
+/// leave it.
 ///
 /// Songs keeps the long-press multi-select and the A–Z fast-scroller from
 /// before. Switching tabs clears the query, so a search meant for one tab never
@@ -49,13 +57,48 @@ class LibraryScreen extends ConsumerStatefulWidget {
 
 class _LibraryScreenState extends ConsumerState<LibraryScreen>
     with SingleTickerProviderStateMixin {
-  final Set<String> _selectedUris = <String>{};
+  /// Widest the search box gets on a desktop window.
+  static const double _searchFieldMaxWidth = 520;
+
+  /// Tab order, as stored names rather than indices, so the persisted choice
+  /// survives a tab being added or reordered later.
+  static const List<String> _tabNames = <String>['songs', 'albums', 'artists'];
+
+  /// Which songs are picked, and where a Shift-click measures from. Held here
+  /// rather than in the rows so it survives a catalog refresh or a rebuild.
+  final TrackSelection _selection = TrackSelection();
   bool _selecting = false;
+
+  /// What the Albums / Artists detail pane is showing on a window wide enough
+  /// to have one. Held here rather than in the panes so it survives the pane
+  /// coming and going with the window width — and so a narrow window's pushed
+  /// route and a wide window's pane are the same screen, opened two ways.
+  String? _paneAlbumId;
+  String? _paneArtistId;
+
+  /// What is picked *inside* those panes, for the same reason: the pane is
+  /// dropped whenever the window narrows past [listDetailMinWidth], so a
+  /// selection owned by the detail screen would not survive a resize the user
+  /// did not think of as leaving it. Reset when the pane moves to another
+  /// album or artist, since a selection only means anything against the list it
+  /// was made in.
+  final TrackSelection _paneAlbumSelection = TrackSelection();
+  final TrackSelection _paneArtistSelection = TrackSelection();
 
   late final TabController _tabController;
   final TextEditingController _searchController = TextEditingController();
   String _query = '';
   int _lastTabIndex = 0;
+
+  /// Whether the user has picked a tab themselves. The current index cannot
+  /// answer that: Songs to Albums and back leaves it at zero again, and a
+  /// restore landing after that would move them somewhere they just left.
+  bool _userChangedTab = false;
+
+  /// Set while the app itself drives the controller, so the one handler for a
+  /// tab change can tell that from a tap: it is neither a choice to remember
+  /// nor a reason to stop a pending restore.
+  bool _programmaticTabChange = false;
 
   /// Pending debounce timer. Cancelled and restarted on every keystroke so the
   /// filter re-runs only once the user pauses typing, not on every character.
@@ -64,8 +107,84 @@ class _LibraryScreenState extends ConsumerState<LibraryScreen>
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 4, vsync: this);
+    _tabController = TabController(length: _tabNames.length, vsync: this);
     _tabController.addListener(_onTabChanged);
+    unawaited(_restoreTab());
+  }
+
+  /// Reopens Library on the tab last used, instead of always on Songs.
+  ///
+  /// Reading is async, so the controller starts on the first tab and moves once
+  /// the value arrives. In practice that is not visible: the tabs only appear
+  /// once the catalog has loaded, which takes longer than a key/value read. The
+  /// guard matters anyway, because a user who switched tabs in the meantime has
+  /// said something more recent than the stored value.
+  Future<void> _restoreTab() async {
+    final String? stored;
+    try {
+      stored = await ref.read(libraryTabStoreProvider).read();
+    } catch (_) {
+      // A storage or plugin failure means no remembered tab, which is the
+      // behaviour before this existed. It must not reach the zone as an
+      // uncaught async error.
+      return;
+    }
+    // Selection is a modal state: it replaces the app bar, hides the tab bar
+    // and blocks swiping. Moving the tab underneath it would leave the song
+    // selection bar sitting over Albums with no visible way back.
+    // A swipe in progress has not moved the index yet, so _userChangedTab is
+    // still false while the user is very much choosing a tab. TabController
+    // reports the drag as a non-zero offset, which is the one signal available
+    // before the gesture settles.
+    if (!mounted ||
+        stored == null ||
+        _userChangedTab ||
+        _selecting ||
+        _tabController.offset != 0) {
+      return;
+    }
+    final int index = _tabNames.indexOf(stored);
+    if (index < 0) return; // A tab that no longer exists: stay on the first.
+    if (index == _tabController.index) return;
+
+    // Driven through the controller rather than around it, so a restore clears
+    // an in-progress search exactly as any other tab change does. Assigning
+    // _lastTabIndex first would make the shared handler return early and carry
+    // a query typed in Songs into Albums.
+    _programmaticTabChange = true;
+    _tabController.index = index;
+    _programmaticTabChange = false;
+  }
+
+  /// Queues the tab writes so they cannot overtake each other.
+  ///
+  /// Switching Albums then Artists faster than the store can write would
+  /// otherwise leave two writes racing, and a slow first one landing last would
+  /// store the tab the user had already left. The queue is FIFO, so the value
+  /// queued last is the value written last.
+  Future<void> _persistQueue = Future<void>.value();
+
+  /// Persists the current tab, swallowing a storage failure.
+  ///
+  /// Losing this preference only means the next launch opens on Songs, which is
+  /// not worth surfacing to someone who was just browsing.
+  ///
+  /// Both the store and the tab name are read here, synchronously, rather than
+  /// inside the queued write. Leaving the screen while a slow write is in
+  /// flight would otherwise strand every newer write behind a disposed
+  /// [State]: the queue would drop them and the older, already-superseded tab
+  /// would be what stayed stored. The write itself needs nothing from the
+  /// widget, so it does not have to outlive it to finish correctly.
+  void _persistTab() {
+    final LibraryTabStore store = ref.read(libraryTabStoreProvider);
+    final String tabName = _tabNames[_tabController.index];
+    _persistQueue = _persistQueue.then((_) async {
+      try {
+        await store.write(tabName);
+      } catch (_) {
+        // Nothing to recover: the next launch simply opens on the first tab.
+      }
+    });
   }
 
   @override
@@ -81,14 +200,25 @@ class _LibraryScreenState extends ConsumerState<LibraryScreen>
   /// when entering/leaving Folders, where the catalog search field is hidden.
   void _onTabChanged() {
     if (_tabController.index == _lastTabIndex) return;
+    if (!_programmaticTabChange) _userChangedTab = true;
     _debounce?.cancel();
     setState(() {
       _lastTabIndex = _tabController.index;
-      if (_query.isNotEmpty) {
+      // The field is the source of truth, not [_query]: typing only reaches
+      // _query after the 300ms debounce, so between a keystroke and that timer
+      // the box holds text while _query is still empty. Testing _query alone
+      // left that text visible on the tab we just moved to, filtering nothing,
+      // and the next keystroke would then apply the whole thing there.
+      if (_query.isNotEmpty || _searchController.text.isNotEmpty) {
         _query = '';
         _searchController.clear();
       }
     });
+    // A restore is replaying what is already stored, so there is nothing new to
+    // write back. Otherwise fire and forget: where the user is reading is not
+    // worth blocking a tab change on.
+    if (_programmaticTabChange) return;
+    _persistTab();
   }
 
   void _onQueryChanged(String value) {
@@ -115,7 +245,7 @@ class _LibraryScreenState extends ConsumerState<LibraryScreen>
     final List<Track> songs = ref.watch(libraryUnifiedTracksProvider);
     final bool hasFolderSources =
         ref.watch(folderBrowsableSourcesProvider).isNotEmpty;
-    final AsyncValue<String?> selectedFolder =
+    final AsyncValue<List<String>> selectedFolder =
         ref.watch(selectedFolderControllerProvider);
     // While a first library sync is running, an empty catalog should read as
     // "filling up", not "nothing here" — so the library never looks broken
@@ -128,44 +258,51 @@ class _LibraryScreenState extends ConsumerState<LibraryScreen>
     // the count and actions stay accurate. Keyed by the provider-namespaced uri,
     // not the bare id, so two different-provider songs sharing an id can't be
     // selected (or bulk-acted on) together.
-    final List<Track> selected = <Track>[
-      for (final Track track in songs)
-        if (_selectedUris.contains(track.uri)) track,
-    ];
-
-    if (_selecting) {
-      return PopScope(
-        canPop: false,
-        onPopInvokedWithResult: (bool didPop, _) {
-          if (!didPop) _exitSelection();
-        },
-        child: Scaffold(
-          appBar: _selectionAppBar(selected),
-          body: _songsList(_filteredSongs(songs)),
-        ),
-      );
-    }
+    final List<Track> selected = _selection.resolve(songs);
 
     // A connected folder-capable server is browseable before (or even without)
     // a flat catalog sync, so it is enough to show the Library tabs on its own.
-    final bool browsing = state.status == LibraryStatus.loaded &&
-        (songs.isNotEmpty || hasFolderSources);
+    // Selecting implies rows to select, so it always browses.
+    final bool browsing = _selecting ||
+        (state.status == LibraryStatus.loaded &&
+            (songs.isNotEmpty || hasFolderSources));
 
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Library'),
-        actions: <Widget>[
-          IconButton(
-            icon: const Icon(Icons.create_new_folder_outlined),
-            tooltip: 'Select music folder',
-            onPressed: _pickAndScan,
-          ),
-        ],
-        bottom: browsing ? _tabBar() : null,
+    // Selection changes the app bar, not the screen. Returning a *different*
+    // widget tree here (a bare Scaffold holding the list) would unmount the
+    // list, and with it the ScrollController that AlphabetTrackList owns, so
+    // long-pressing a row halfway down the catalog jumped back to the top
+    // (#582). Everything below therefore stays in the same slot in both modes.
+    return PopScope(
+      canPop: !_selecting,
+      onPopInvokedWithResult: (bool didPop, _) {
+        if (!didPop && _selecting) _exitSelection();
+      },
+      child: SelectionEscapeScope(
+        selecting: _selecting,
+        onEscape: _exitSelection,
+        child: Scaffold(
+          appBar: _selecting
+              ? _selectionAppBar(selected)
+              : AppBar(
+                  title: const Text('Library'),
+                  actions: <Widget>[
+                    IconButton(
+                      icon: const Icon(Icons.create_new_folder_outlined),
+                      tooltip: 'Select music folder',
+                      onPressed: _pickAndScan,
+                    ),
+                  ],
+                  bottom: browsing ? _tabBar() : null,
+                ),
+          body: browsing
+              ? _browseBody(songs, syncingSources)
+              : _statusBody(
+                  state,
+                  selectedFolder.valueOrNull ?? const <String>[],
+                  syncingSources,
+                ),
+        ),
       ),
-      body: browsing
-          ? _browseBody(songs, syncingSources)
-          : _statusBody(state, selectedFolder.valueOrNull, syncingSources),
     );
   }
 
@@ -174,6 +311,20 @@ class _LibraryScreenState extends ConsumerState<LibraryScreen>
     return TabBar(
       key: const Key('library_tabs'),
       controller: _tabController,
+      // Tapping the tab you are already on is still you choosing a tab, but it
+      // leaves the controller index untouched, so the listener never runs: it
+      // would neither mark the choice nor store it. A restore still in flight
+      // would move you off the tab you just asked for, and the next cold launch
+      // would open on the tab you had just rejected.
+      //
+      // TabBar calls animateTo before onTap, so the index is already current
+      // here. A tap that did change tabs therefore queues the same value the
+      // listener just queued, which is a harmless second write of a value that
+      // is already stored.
+      onTap: (_) {
+        _userChangedTab = true;
+        _persistTab();
+      },
       indicatorColor: theme.colorScheme.secondary,
       indicatorSize: TabBarIndicatorSize.label,
       labelColor: theme.colorScheme.secondary,
@@ -182,7 +333,6 @@ class _LibraryScreenState extends ConsumerState<LibraryScreen>
         Tab(text: 'Songs'),
         Tab(text: 'Albums'),
         Tab(text: 'Artists'),
-        Tab(text: 'Folders'),
       ],
     );
   }
@@ -190,7 +340,7 @@ class _LibraryScreenState extends ConsumerState<LibraryScreen>
   /// Loading / error / folder-pick states, shown full-body without tabs.
   Widget _statusBody(
     LibraryState state,
-    String? selectedFolder,
+    List<String> selectedFolders,
     List<String> syncingSources,
   ) {
     switch (state.status) {
@@ -211,18 +361,16 @@ class _LibraryScreenState extends ConsumerState<LibraryScreen>
           return _LibrarySyncing(headline: headline);
         }
         return _LibraryEmpty(
-          selectedFolder: selectedFolder,
+          selectedFolders: selectedFolders,
           onPick: _pickAndScan,
           onRescan:
-              selectedFolder == null ? null : () => _rescan(selectedFolder),
+              selectedFolders.isEmpty ? null : () => _rescan(selectedFolders),
         );
     }
   }
 
-  /// Catalog search + four browse tabs. Folders performs its own hierarchical
-  /// navigation, so the flat-catalog search field is hidden on that tab.
+  /// Catalog search + the three browse tabs.
   Widget _browseBody(List<Track> songs, List<String> syncingSources) {
-    final bool foldersTab = _tabController.index == 3;
     // A connected folder-capable server (Jellyfin, Navidrome/Subsonic) shows the
     // tabs the moment it connects, so its *first* sync lands here rather than in
     // [_statusBody]. Pass the syncing sources down so the catalog tabs say
@@ -230,20 +378,38 @@ class _LibraryScreenState extends ConsumerState<LibraryScreen>
     final String? syncHeadline = syncingHeadline(syncingSources);
     return Column(
       children: <Widget>[
-        if (!foldersTab)
-          LibrarySearchField(
-            controller: _searchController,
-            onChanged: _onQueryChanged,
-            onClear: _clearSearch,
+        // Selection hides the search box, but the slot keeps exactly one child
+        // either way: dropping it would move the Expanded below to index 0, and
+        // an unkeyed Column re-inflates a child whose index changed — which is
+        // the scroll position we are here to preserve (#582).
+        if (_selecting)
+          const SizedBox.shrink()
+        else
+          // The box is a text input, not content: on a wide window it stops
+          // growing and stays left-aligned under the tabs rather than running
+          // the width of a monitor.
+          Align(
+            alignment: AlignmentDirectional.centerStart,
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: _searchFieldMaxWidth),
+              child: LibrarySearchField(
+                controller: _searchController,
+                onChanged: _onQueryChanged,
+                onClear: _clearSearch,
+              ),
+            ),
           ),
         Expanded(
           child: TabBarView(
             controller: _tabController,
+            // The tab bar is hidden while selecting, so a swipe would be an
+            // undocumented way out of selection mode (and onto rows the count
+            // in the app bar does not describe).
+            physics: _selecting ? const NeverScrollableScrollPhysics() : null,
             children: <Widget>[
               _songsTab(songs, syncHeadline),
               _albumsTab(syncHeadline),
               _artistsTab(syncHeadline),
-              const FolderBrowserTab(),
             ],
           ),
         ),
@@ -279,10 +445,37 @@ class _LibraryScreenState extends ConsumerState<LibraryScreen>
         message: 'You can still browse the connected server from Folders.',
       );
     }
-    return AlbumGrid(
-      albums: filtered,
-      onOpen: (Album album) =>
-          context.push(AppRoutes.albumDetailPath(album.id)),
+    return ListDetailPanes(
+      listBuilder: (BuildContext context, bool paneVisible) => AlbumGrid(
+        albums: filtered,
+        onOpen: (Album album) {
+          if (!paneVisible) {
+            context.push(AppRoutes.albumDetailPath(album.id));
+            return;
+          }
+          setState(() {
+            if (_paneAlbumId != album.id) _paneAlbumSelection.clear();
+            _paneAlbumId = album.id;
+          });
+        },
+      ),
+      // A selection that is no longer in the filtered grid would leave the pane
+      // showing an album the list says isn't there, so the pane follows the
+      // search rather than outliving it.
+      detailBuilder: (BuildContext context) {
+        final String? id = _paneAlbumId;
+        if (id == null) return null;
+        if (!filtered.any((Album album) => album.id == id)) return null;
+        return AlbumDetailScreen(
+          key: ValueKey<String>(id),
+          albumId: id,
+          selection: _paneAlbumSelection,
+        );
+      },
+      placeholderBuilder: (BuildContext context) => const DetailPanePlaceholder(
+        icon: Icons.album_outlined,
+        message: 'Pick an album to see its songs here.',
+      ),
     );
   }
 
@@ -298,29 +491,53 @@ class _LibraryScreenState extends ConsumerState<LibraryScreen>
         message: 'You can still browse the connected server from Folders.',
       );
     }
-    return ListView.builder(
-      key: const Key('library_artist_list'),
-      itemCount: filtered.length,
-      itemBuilder: (context, index) {
-        final Artist artist = filtered[index];
-        return ArtistTile(
-          artist: artist,
-          onTap: () => context.push(AppRoutes.artistDetailPath(artist.id)),
+    return ListDetailPanes(
+      listBuilder: (BuildContext context, bool paneVisible) => ArtistGrid(
+        artists: filtered,
+        onOpen: (Artist artist) {
+          if (!paneVisible) {
+            context.push(AppRoutes.artistDetailPath(artist.id));
+            return;
+          }
+          setState(() {
+            if (_paneArtistId != artist.id) _paneArtistSelection.clear();
+            _paneArtistId = artist.id;
+          });
+        },
+      ),
+      detailBuilder: (BuildContext context) {
+        final String? id = _paneArtistId;
+        if (id == null) return null;
+        if (!filtered.any((Artist artist) => artist.id == id)) return null;
+        return ArtistDetailScreen(
+          key: ValueKey<String>(id),
+          artistId: id,
+          selection: _paneArtistSelection,
         );
       },
+      placeholderBuilder: (BuildContext context) => const DetailPanePlaceholder(
+        icon: Icons.person_outline,
+        message: 'Pick an artist to see their albums here.',
+      ),
     );
   }
 
   List<Track> _filteredSongs(List<Track> songs) => filterTracks(songs, _query);
 
   Widget _songsList(List<Track> tracks) {
-    return AlphabetTrackList(
-      tracks: tracks,
-      selectable: true,
-      selectionActive: _selecting,
-      selectedUris: _selectedUris,
-      onSelectStart: _enterSelection,
-      onSelectToggle: _toggle,
+    // Song rows are a single column of text: past [maxContentWidth] the title
+    // and the trailing menu end up a screen apart, so the column stops growing
+    // and centres instead of stretching across a desktop monitor.
+    return AdaptiveContentWidth(
+      child: AlphabetTrackList(
+        tracks: tracks,
+        selectable: true,
+        selectionActive: _selecting,
+        selectedUris: _selection.uris,
+        onSelectStart: _enterSelection,
+        onSelectToggle: _toggle,
+        onSelectRange: _extendSelection,
+      ),
     );
   }
 
@@ -363,25 +580,42 @@ class _LibraryScreenState extends ConsumerState<LibraryScreen>
   void _enterSelection(Track track) {
     setState(() {
       _selecting = true;
-      _selectedUris
-        ..clear()
-        ..add(track.uri);
+      _selection.start(track);
     });
+    // Selection is only reachable from the songs list, so that is the list it
+    // must show. Guarding the restore is not enough on its own: a long press
+    // holds the pointer for half a second before firing, and a restore landing
+    // inside that window sees no selection yet and moves the tab underneath the
+    // gesture. Coming back here closes it from the other end, whatever the
+    // timing was.
+    if (_tabController.index != 0) {
+      _programmaticTabChange = true;
+      _tabController.index = 0;
+      _programmaticTabChange = false;
+    }
   }
 
   void _toggle(Track track) {
     setState(() {
-      if (!_selectedUris.add(track.uri)) {
-        _selectedUris.remove(track.uri);
-      }
-      if (_selectedUris.isEmpty) _selecting = false;
+      _selection.toggle(track);
+      if (!_selection.isActive) _selecting = false;
+    });
+  }
+
+  /// Shift-click: everything between the anchor and the clicked row, over the
+  /// list the A–Z view actually shows — so a search or a re-sort can never make
+  /// a range span rows that are not between its two ends on screen.
+  void _extendSelection(List<Track> tracks, int index) {
+    setState(() {
+      _selection.extendTo(tracks, index);
+      _selecting = _selection.isActive;
     });
   }
 
   void _exitSelection() {
     setState(() {
       _selecting = false;
-      _selectedUris.clear();
+      _selection.clear();
     });
   }
 
@@ -410,21 +644,28 @@ class _LibraryScreenState extends ConsumerState<LibraryScreen>
 
   // --- Scan -------------------------------------------------------------
 
-  /// Open the system folder picker, persist the choice, then scan it. A
-  /// cancelled pick leaves everything untouched. The UI only talks to the two
+  /// Open the system folder picker, persist the choice, then scan. A cancelled
+  /// pick leaves everything untouched. The UI only talks to the two
   /// controllers — never to a picker plugin or the file system directly.
+  ///
+  /// Desktop adds the folder to the ones already selected; Android replaces the
+  /// selection, because its local access is a single grant at a time.
   Future<void> _pickAndScan() async {
-    final String? path = await ref
-        .read(selectedFolderControllerProvider.notifier)
-        .pickAndPersist();
-    if (path != null) {
-      await ref.read(libraryControllerProvider.notifier).scanFolder(path);
-    }
+    final SelectedFolderController folders =
+        ref.read(selectedFolderControllerProvider.notifier);
+    final bool isAndroid = ref.read(hostPlatformProvider).isAndroid;
+    final String? path =
+        isAndroid ? await folders.pickAndPersist() : await folders.pickAndAdd();
+    if (path == null) return;
+    final List<String> selected =
+        ref.read(selectedFolderControllerProvider).valueOrNull ??
+            <String>[path];
+    await ref.read(libraryControllerProvider.notifier).scanFolders(selected);
   }
 
   /// Re-scan the folder the user already selected, without opening the picker.
-  Future<void> _rescan(String folder) {
-    return ref.read(libraryControllerProvider.notifier).scanFolder(folder);
+  Future<void> _rescan(List<String> folders) {
+    return ref.read(libraryControllerProvider.notifier).scanFolders(folders);
   }
 }
 
@@ -510,32 +751,37 @@ class _LibrarySyncing extends StatelessWidget {
   }
 }
 
-/// The empty state, split by whether a folder has been selected yet so the
-/// user always sees the right next step:
-///  - no folder chosen → invite them to pick one;
-///  - folder chosen but nothing found → show the folder and offer a re-scan or
-///    a change of folder.
+/// The empty state, split by which local source is selected so the user always
+/// sees the right next step:
+///  - nothing chosen → invite them to pick a folder;
+///  - a folder chosen but nothing found → show the folder and offer a re-scan
+///    or a change of folder;
+///  - Android's device-wide MediaStore library chosen → there is no folder to
+///    reselect, so say the device reported no music and offer a rescan.
 class _LibraryEmpty extends StatelessWidget {
   const _LibraryEmpty({
-    required this.selectedFolder,
+    required this.selectedFolders,
     required this.onPick,
     this.onRescan,
   });
 
-  final String? selectedFolder;
+  final List<String> selectedFolders;
   final VoidCallback onPick;
   final VoidCallback? onRescan;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final hasFolder = selectedFolder != null;
+    final hasFolder = selectedFolders.isNotEmpty;
+    final FolderLocation? location =
+        hasFolder ? FolderLocation.parse(selectedFolders.first) : null;
+    final bool isDeviceLibrary = location?.isAndroidMediaStore ?? false;
     // A folder selected as a plain filesystem path on Android is the legacy/
     // broken case: scoped storage won't let Linthra read it, so it turns up
     // empty. Nudge the user to pick it again, which now returns a SAF grant.
-    final bool needsRepick = hasFolder &&
-        Platform.isAndroid &&
-        !FolderLocation.parse(selectedFolder!).isContentUri;
+    // The MediaStore sentinel is not a path, so it must not land here.
+    final bool needsRepick =
+        hasFolder && Platform.isAndroid && location!.isFilesystemPath;
     return Center(
       child: Padding(
         padding: const EdgeInsets.all(AppSpacing.xl),
@@ -557,10 +803,15 @@ class _LibraryEmpty extends StatelessWidget {
             ),
             const SizedBox(height: AppSpacing.sm),
             Text(
-              hasFolder
-                  ? 'Nothing playable turned up in:\n'
-                      '${FolderLocation.parse(selectedFolder!).displayLabel}'
-                  : 'Choose a folder on your device to scan for music.',
+              isDeviceLibrary
+                  ? "Android's music library reported no audio on this device."
+                  : selectedFolders.length > 1
+                      ? 'Nothing playable turned up in your '
+                          '${selectedFolders.length} music folders.'
+                      : hasFolder
+                          ? 'Nothing playable turned up in:\n'
+                              '${location!.displayLabel}'
+                          : 'Choose a folder on your device to scan for music.',
               style: theme.textTheme.bodyMedium?.copyWith(
                 color: theme.colorScheme.onSurface.withValues(alpha: 0.6),
               ),
@@ -580,12 +831,24 @@ class _LibraryEmpty extends StatelessWidget {
             if (hasFolder) ...[
               FilledButton.tonal(
                 onPressed: onRescan,
-                child: const Text('Rescan folder'),
+                child: Text(
+                  isDeviceLibrary
+                      ? 'Rescan this device'
+                      : selectedFolders.length > 1
+                          ? 'Rescan folders'
+                          : 'Rescan folder',
+                ),
               ),
               const SizedBox(height: AppSpacing.sm),
               TextButton(
                 onPressed: onPick,
-                child: const Text('Change folder'),
+                child: Text(
+                  isDeviceLibrary
+                      ? 'Use a folder instead'
+                      : selectedFolders.length > 1
+                          ? 'Add a folder'
+                          : 'Change folder',
+                ),
               ),
             ] else
               FilledButton(

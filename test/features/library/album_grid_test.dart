@@ -17,9 +17,6 @@ import 'package:linthra/features/player/widgets/album_artwork.dart';
 import '../player/fake_playback_controller.dart';
 import 'fake_music_library_repository.dart';
 
-// No artworkUri anywhere, so these widget tests never reach for the network:
-// every cover falls back to the placeholder, which is also the "album without
-// artwork" case exercised below.
 const List<Track> _tracks = <Track>[
   Track(
     id: '1',
@@ -44,7 +41,6 @@ const List<Track> _tracks = <Track>[
   ),
 ];
 
-/// Six albums, enough rows to tell two columns from three or four.
 List<Track> _manyAlbums() => <Track>[
       for (int i = 0; i < 6; i++)
         Track(
@@ -73,11 +69,10 @@ GoRouter _router() {
   );
 }
 
-/// Pumps the Library at a given logical screen size and lands on Albums.
 Future<void> _pumpAlbums(
   WidgetTester tester, {
   List<Track>? tracks,
-  Size size = const Size(390, 844), // a typical phone
+  Size size = const Size(390, 844),
 }) async {
   tester.view.devicePixelRatio = 1.0;
   tester.view.physicalSize = size;
@@ -100,7 +95,6 @@ Future<void> _pumpAlbums(
   await tester.pumpAndSettle();
 }
 
-/// On-screen rectangles of every laid-out album card.
 List<Rect> _cardRects(WidgetTester tester) {
   return tester.elementList(find.byType(AlbumGridCard)).map((Element e) {
     final RenderBox box = e.renderObject! as RenderBox;
@@ -108,7 +102,6 @@ List<Rect> _cardRects(WidgetTester tester) {
   }).toList();
 }
 
-/// The cards sharing the topmost row, left to right.
 List<Rect> _firstRow(WidgetTester tester) {
   final List<Rect> rects = _cardRects(tester);
   final double top = rects
@@ -123,19 +116,55 @@ List<Rect> _firstRow(WidgetTester tester) {
 void main() {
   group('albumGridColumnCount', () {
     test('a phone-width content box gets exactly two columns', () {
-      expect(albumGridColumnCount(328), 2); // 360dp phone, minus padding
-      expect(albumGridColumnCount(358), 2); // 390dp phone, minus padding
-      expect(albumGridColumnCount(398), 2); // 430dp phone, minus padding
+      expect(albumGridColumnCount(328), 2);
+      expect(albumGridColumnCount(358), 2);
+      expect(albumGridColumnCount(398), 2);
     });
 
-    test('a third column only lands once there is room for one', () {
-      expect(albumGridColumnCount(560), 2);
-      expect(albumGridColumnCount(600), 3);
-      expect(albumGridColumnCount(800), 4);
+    test('a third column waits for its cards and both gutters', () {
+      expect(albumGridColumnCount(600), 2);
+      expect(albumGridColumnCount(631), 2);
+      expect(albumGridColumnCount(632), 3);
+      expect(albumGridColumnCount(800), 3);
+      expect(albumGridColumnCount(848), 4);
     });
 
-    test('columns are capped so covers never shrink to thumbnails', () {
-      expect(albumGridColumnCount(4000), 6);
+    test('desktop widths add columns instead of inflating covers', () {
+      expect(albumGridColumnCount(1168), 5); // 1280x720
+      expect(albumGridColumnCount(1808), 7); // 1920x1080
+      expect(albumGridColumnCount(2448), 9); // 2560x1440
+      expect(albumGridColumnCount(3120), 12); // ultrawide
+    });
+
+    test('common 4K width grows beyond the old twelve-column cap', () {
+      expect(albumGridColumnCount(3700), 14);
+      expect(albumGridColumnCount(3700), greaterThan(12));
+    });
+
+    test('desktop cards honor the declared 200-260 width band', () {
+      const double gutter = 16;
+      for (final double width in <double>[
+        632,
+        848,
+        1168,
+        1808,
+        2448,
+        3120,
+        3700,
+      ]) {
+        final int columns = albumGridColumnCount(width);
+        final double cardWidth = (width - gutter * (columns - 1)) / columns;
+        expect(
+          cardWidth,
+          greaterThanOrEqualTo(200),
+          reason: 'minimum at $width with $columns columns',
+        );
+        expect(
+          cardWidth,
+          lessThanOrEqualTo(260),
+          reason: 'maximum at $width with $columns columns',
+        );
+      }
     });
 
     test('a degenerate width still renders two columns', () {
@@ -164,8 +193,6 @@ void main() {
 
       final List<Rect> row = _firstRow(tester);
       expect(row.length, 2);
-
-      // Both cards are on screen, side by side, and each is wide enough to read.
       expect(row.first.left, lessThan(row.last.left));
       expect(row.last.right, lessThanOrEqualTo(390));
       expect(row.first.width, greaterThan(120));
@@ -195,13 +222,55 @@ void main() {
       expect(_firstRow(tester).length, greaterThan(2));
     });
 
+    testWidgets('a desktop window keeps covers card-sized, not inflated',
+        (tester) async {
+      await _pumpAlbums(
+        tester,
+        tracks: _manyAlbums(),
+        size: const Size(1920, 1080),
+      );
+
+      final List<Rect> row = _firstRow(tester);
+      expect(row.length, 6);
+      for (final Rect card in row) {
+        expect(card.width, lessThan(300));
+        expect(card.width, greaterThan(180));
+      }
+      expect(row.last.right, lessThanOrEqualTo(1920));
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('resizing from phone to desktop reflows without overflow',
+        (tester) async {
+      await _pumpAlbums(tester, tracks: _manyAlbums());
+      expect(_firstRow(tester).length, 2);
+
+      for (final Size size in <Size>[
+        const Size(800, 720),
+        const Size(1280, 720),
+        const Size(2560, 1440),
+        const Size(3440, 1440),
+        const Size(3840, 2160),
+        const Size(390, 844),
+      ]) {
+        tester.view.physicalSize = size;
+        await tester.pumpAndSettle();
+        expect(tester.takeException(), isNull, reason: 'at $size');
+        final List<Rect> row = _firstRow(tester);
+        expect(
+          row.last.right,
+          lessThanOrEqualTo(size.width),
+          reason: 'at $size',
+        );
+      }
+    });
+
     testWidgets('tapping a card opens that album', (tester) async {
       await _pumpAlbums(tester);
 
       await tester.tap(find.text('Discovery'));
       await tester.pumpAndSettle();
 
-      // On the album detail screen, showing only Discovery's tracks.
       expect(find.text('Play'), findsOneWidget);
       expect(find.text('Alpha'), findsOneWidget);
       expect(find.text('Beta'), findsOneWidget);
@@ -219,8 +288,8 @@ void main() {
     });
 
     testWidgets(
-        'long-pressing a card still offers the whole album to a '
-        'playlist', (tester) async {
+        'long-pressing a card still offers the whole album to a playlist',
+        (tester) async {
       await _pumpAlbums(tester);
 
       await tester.longPress(find.text('Discovery'));
@@ -275,7 +344,6 @@ void main() {
         ],
       );
 
-      // A RenderFlex/paragraph overflow surfaces as a pumped exception.
       expect(tester.takeException(), isNull);
 
       final Finder card = find.byType(AlbumGridCard);
@@ -290,8 +358,6 @@ void main() {
       );
       expect(artist.maxLines, 1);
       expect(artist.overflow, TextOverflow.ellipsis);
-
-      // The card still sits inside the viewport, text and all.
       expect(tester.getRect(card).bottom, lessThanOrEqualTo(844));
     });
 

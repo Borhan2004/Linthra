@@ -46,6 +46,8 @@ class PlaybackProgressBar extends StatefulWidget {
     required this.onSeek,
     this.playing = false,
     this.style = defaultPlaybackProgressStyle,
+    this.density = WavySeekBarDensity.standard,
+    this.showTimeLabels = true,
     super.key,
   });
 
@@ -62,6 +64,16 @@ class PlaybackProgressBar extends StatefulWidget {
 
   /// Which renderer to use. Defaults to [defaultPlaybackProgressStyle].
   final PlaybackProgressStyle style;
+
+  /// How much room the bar takes. Both renderers honour it: the mini-player
+  /// gives its 64dp bar a compact one and needs that to hold whichever
+  /// renderer [defaultPlaybackProgressStyle] currently selects.
+  final WavySeekBarDensity density;
+
+  /// Whether the elapsed/total caption is drawn under the bar. The now-playing
+  /// *bar* turns it off: it has no room for it, and the full player one tap
+  /// away shows both times.
+  final bool showTimeLabels;
 
   /// How close [position] has to land to a released seek target before the bar
   /// hands the display back to it.
@@ -172,6 +184,11 @@ class _PlaybackProgressBarState extends State<PlaybackProgressBar> {
         _pendingSeekMs?.clamp(0, totalMs.toDouble()) ??
         posMs.toDouble();
 
+    // Both renderers answer to the density: a call site that has only a few
+    // pixels (the mini player) must not sprout a full-size control if
+    // [defaultPlaybackProgressStyle] is ever flipped back to the slider.
+    final bool compact = widget.density == WavySeekBarDensity.compact;
+
     final muted = theme.colorScheme.onSurfaceVariant;
     final labelStyle = theme.textTheme.labelSmall?.copyWith(
       color: muted,
@@ -189,12 +206,19 @@ class _PlaybackProgressBarState extends State<PlaybackProgressBar> {
               onChangeEnd: canSeek ? _onChangeEnd : null,
               semanticFormatter: _formatMs,
               playing: widget.playing,
+              density: widget.density,
             ),
           PlaybackProgressStyle.slider => SliderTheme(
               data: SliderTheme.of(context).copyWith(
-                trackHeight: 4,
-                overlayShape: const RoundSliderOverlayShape(overlayRadius: 12),
-                thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+                trackHeight: compact ? 2 : 4,
+                // The slider's height is its overlay's, so shrinking that is
+                // what keeps the fallback inside a bar sized for the wave.
+                overlayShape: RoundSliderOverlayShape(
+                  overlayRadius: compact ? 6 : 12,
+                ),
+                thumbShape: RoundSliderThumbShape(
+                  enabledThumbRadius: compact ? 3 : 6,
+                ),
                 inactiveTrackColor:
                     theme.colorScheme.onSurface.withValues(alpha: 0.15),
               ),
@@ -216,19 +240,20 @@ class _PlaybackProgressBarState extends State<PlaybackProgressBar> {
         },
         // Snug under the track and aligned to its ends, so the times read as a
         // caption for the bar rather than a separate, floating row.
-        Padding(
-          padding: const EdgeInsets.only(top: AppSpacing.xs),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Text(_formatMs(barValue), style: labelStyle),
-              Text(
-                hasDuration ? _format(widget.duration) : '--:--',
-                style: labelStyle,
-              ),
-            ],
+        if (widget.showTimeLabels)
+          Padding(
+            padding: const EdgeInsets.only(top: AppSpacing.xs),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text(_formatMs(barValue), style: labelStyle),
+                Text(
+                  hasDuration ? _format(widget.duration) : '--:--',
+                  style: labelStyle,
+                ),
+              ],
+            ),
           ),
-        ),
       ],
     );
   }

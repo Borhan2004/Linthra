@@ -4,6 +4,7 @@ name: CI
 # main. Four independent jobs run in parallel:
 #   * flutter             — format, analyze, test, lockfile-enforced pub get.
 #   * secret-scan         — offline scan for committed secrets / private data.
+#   * cast-containment    — tripwire on the Cast containment's source markers.
 #   * release-bump-guard  — release/* PRs only: the bump must be version-only.
 #   * dependency-guard    — deps/* PRs only: the update must be lockfile-only.
 #   * toolchain-guard     — toolchain/flutter-sdk only: the bump must be
@@ -76,6 +77,82 @@ jobs:
       # `./scripts/check_secrets.sh` (also wired into scripts/verify_android.sh).
       - name: Scan for secrets and private data
         run: ./scripts/check_secrets.sh
+
+  cast-containment:
+    name: Cast containment markers
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Pure python, no toolchain: greps for the markers of the three layers
+      # that keep casting out of production builds (the constant, the production
+      # wiring, the transport's own refusals), because the change that quietly
+      # restores casting is exactly the one nobody labels as such.
+      #
+      # It is a tripwire, not proof — it matches source patterns in four known
+      # files and cannot see a bypass that leaves those patterns intact. The
+      # runtime evidence is in the Flutter checks job above
+      # (test/app/production_cast_containment_test.dart and
+      # test/core/services/cast/cast_containment_test.dart); the script's own
+      # limitations are documented in its docstring. Local twin:
+      # `python3 scripts/check_cast_containment.py`.
+      - name: Check cast containment markers
+        run: python3 scripts/check_cast_containment.py
+
+      # The artifact-level twin of the tripwire above: scripts/
+      # verify_release_containment.py reads the compiled Dart inside a built
+      # APK/AAB/tarball and refuses an artifact that does not look contained.
+      # The release workflows run it on the real artifacts; this runs its unit
+      # tests on synthetic ones, so a change that makes the verifier stop
+      # catching an uncontained build is caught here rather than at release
+      # time. Local twin: `python3 test/tooling/verify_release_containment_test.py`.
+      - name: Test the release artifact verifier
+        run: python3 test/tooling/verify_release_containment_test.py
+
+      # The release version is written down in five places (pubspec, the About
+      # screen, the Play changelog, the F-Droid entry, the AppStream release
+      # entry a software centre shows). Nothing fails to build when one of them
+      # is left behind (the listing just tells people the wrong thing), so it
+      # is checked here rather than at submission time (#452). Local twin:
+      # `python3 scripts/check_release_metadata_sync.py`.
+      - name: Check release metadata is in sync
+        run: python3 scripts/check_release_metadata_sync.py
+
+      - name: Test the release metadata checker
+        run: python3 test/tooling/check_release_metadata_sync_test.py
+
+      # The Flatpak audio smoke (#446) runs against a manifest derived from the
+      # submission manifest, and the derivation is only trustworthy because the
+      # generator refuses to change anything but the app module's build
+      # commands. That refusal is what these tests hold it to, and they run here
+      # rather than in the 90-minute Flatpak job so a manifest regenerated into
+      # a shape the generator no longer understands is caught on any PR. Local
+      # twin: `python3 test/tooling/make_flatpak_smoke_manifest_test.py`.
+      - name: Test the Flatpak smoke manifest generator
+        run: |
+          python3 -m pip install --quiet PyYAML
+          python3 test/tooling/make_flatpak_smoke_manifest_test.py
+
+      # The Flathub linter itself needs a Flatpak and, for two of its three
+      # modes, a 90-minute build, so it runs in the Flatpak workflow. What
+      # runs here is the judgement wrapped around it: that a missing linter is
+      # not a pass, that a finding needs a written reason, and that a reason
+      # for a finding the linter no longer reports is itself a failure (#449).
+      # Local twin: `python3 test/tooling/flathub_builder_lint_test.py`.
+      - name: Test the Flathub lint runner
+        run: python3 test/tooling/flathub_builder_lint_test.py
+
+      # Every Flatpak permission has to be explained in a table a reviewer can
+      # read, and an explanation cannot outlive the permission it explains
+      # (#455). Cheap and toolchain-free, so it runs on every PR rather than in
+      # the 90-minute Flatpak job. Local twin:
+      # `python3 scripts/check_flatpak_permissions.py`.
+      - name: Check every Flatpak permission has a written rationale
+        run: python3 scripts/check_flatpak_permissions.py
+
+      - name: Test the Flatpak permission checker
+        run: python3 test/tooling/check_flatpak_permissions_test.py
 
   release-bump-guard:
     name: Release bump touches only version files

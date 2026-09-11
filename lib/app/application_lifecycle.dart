@@ -4,22 +4,30 @@ import 'dart:io';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/lifecycle/async_disposal_registry.dart';
+import '../core/models/desktop_close_behavior.dart';
 import '../core/models/plex_session.dart';
 import '../core/models/subsonic_session.dart';
 import '../core/services/artwork_disk_cache.dart';
+import '../core/services/desktop_window_lifecycle_service.dart';
 import '../core/services/media_session_binding.dart';
 import '../core/services/playback_session_persistence.dart';
+import '../core/services/playback_volume_persistence.dart';
 import '../core/sources/plex/plex_artwork.dart';
 import '../core/sources/subsonic/subsonic_artwork.dart';
 import '../data/repositories/download_repository_provider.dart';
 import '../data/repositories/favorites_repository_provider.dart';
 import '../data/repositories/music_library_repository_provider.dart';
+import '../data/repositories/playback_preferences_provider.dart';
 import '../data/repositories/playback_session_store_provider.dart';
 import '../data/repositories/playlist_repository_provider.dart';
 import '../data/repositories/remote_cache_index_provider.dart';
 import '../features/player/media_artwork_providers.dart';
 import '../features/player/player_providers.dart';
+import '../features/settings/audiobookshelf/audiobookshelf_settings_controller.dart';
+import '../features/settings/desktop/close_behavior_controller.dart';
+import '../features/settings/desktop/desktop_window_providers.dart';
 import '../features/settings/jellyfin/jellyfin_settings_controller.dart';
+import '../features/settings/playback/audio_output_controller.dart';
 import '../features/settings/playback/normalize_volume_controller.dart';
 import '../features/settings/plex/plex_settings_controller.dart';
 import '../features/settings/subsonic/subsonic_settings_controller.dart';
@@ -41,10 +49,11 @@ export 'application_container.dart' show productionApplicationOverrides;
 /// `ProviderContainer.dispose()`.
 ///
 /// One thing it deliberately does not release: the Android media session. The
-/// graceful-shutdown path is desktop-only (see `PlatformShutdownPolicy`), where
-/// the media-session binding is the inert one; on Android the session belongs
-/// to `audio_service`'s foreground service and the platform, not to this
-/// handle.
+/// graceful-shutdown path is desktop-only (see `PlatformShutdownPolicy`), and
+/// on Android the session belongs to `audio_service`'s foreground service and
+/// the platform, not to this handle — so its [MediaSession] detaches to
+/// nothing. Linux's MPRIS session *is* released here: the bus name is Linthra's
+/// to give back.
 class ApplicationHandle {
   /// Creates a handle for [container].
   ///
@@ -177,22 +186,66 @@ Future<ApplicationHandle> bootstrapApplication(
   ProviderContainer container, {
   bool installPersistentArtworkCache = true,
   Directory? artworkCacheDirectory,
+  MediaSessionBinding mediaSessionBinding = const PlatformMediaSessionBinding(),
 }) async {
   final ApplicationHandle handle = ApplicationHandle(container: container);
   try {
-    // Attaching the session is best-effort and platform-routed: on a platform
-    // with no media session (Linux today) the binding is the inert one and
-    // `audio_service` is never initialised at all. On Android it attaches the
-    // real session; the handler mirrors the controller and outlives this scope
-    // with the container.
-    await const PlatformMediaSessionBinding().attach(
+    // The desktop window lifecycle (#401): what a window close does, and the
+    // explicit quit. Started before the media session so MPRIS can offer the
+    // same Raise/Quit the window itself does, and handed the graceful shutdown
+    // so an explicit quit releases audio, the bus name and the database before
+    // the process ends rather than racing the engine on the way down.
+    //
+    // Inert off the desktop: the window controller is then the no-op one, so
+    // nothing is pushed anywhere and nothing is ever hidden.
+    final DesktopWindowLifecycleService desktopWindow =
+        container.read(desktopWindowLifecycleServiceProvider);
+    desktopWindow.installShutdown(handle.shutdown);
+    desktopWindow.start();
+
+    // Mirror the user's close-behaviour choice onto the runner, seeding the
+    // persisted value now and pushing every later change. The runner has to
+    // answer a GTK delete-event synchronously, so it is told the answer ahead
+    // of time rather than asked for one.
+    handle.ownSubscription(
+      container.listen<AsyncValue<DesktopCloseBehavior>>(
+        desktopCloseBehaviorControllerProvider,
+        (_, AsyncValue<DesktopCloseBehavior> next) {
+          desktopWindow.setCloseBehavior(
+            next.valueOrNull ?? DesktopCloseBehavior.defaultBehavior,
+          );
+        },
+        fireImmediately: true,
+      ),
+    );
+
+    // Attaching the session is best-effort and platform-routed: Android gets
+    // the real `audio_service` session, Linux gets MPRIS, and every other
+    // platform gets the inert binding so `audio_service` is never initialised
+    // where it has no implementation.
+    //
+    // Injectable for the same reason `MprisMediaSessionBinding` takes a D-Bus
+    // client factory: the default reads the real host, so a bootstrap test run
+    // on a Linux machine reaches the real session bus. That is not this
+    // suite's business, and it is not deterministic either — how long the
+    // connection attempt takes decides how far bootstrap has got by the time
+    // the test looks, which is what made the failure-cleanup test flaky.
+    final MediaSession? session = await mediaSessionBinding.attach(
       container.read(playbackControllerProvider),
       container.read(musicLibraryRepositoryProvider),
       playlists: container.read(playlistRepositoryProvider),
       favorites: container.read(favoritesRepositoryProvider),
       downloads: container.read(downloadRepositoryProvider),
       artwork: container.read(mediaArtworkCacheProvider),
+      // Raise and Quit for the desktop session. Off the desktop this is still
+      // the inert service, and the Android session ignores it entirely.
+      application: desktopWindow,
     );
+    // Owned so shutdown gives the session back. On Android that is a no-op (the
+    // session belongs to the foreground service), but on Linux it releases the
+    // MPRIS bus name — a player that exits still holding it leaves a ghost in
+    // every shell that was listening.
+    if (session != null) handle.own(session.detach);
 
     // Side-effect-only services: instantiating each one wires its listener.
     // They are disposed with the container, and — because each registers with
@@ -223,6 +276,33 @@ Future<ApplicationHandle> bootstrapApplication(
       ),
     );
 
+    // Re-apply a saved audio output (Linux) so a chosen headset, DAC or HDMI
+    // sink survives a restart without the listener re-picking it.
+    //
+    // Awaited, because the alternative leaks audio: the media_kit player is
+    // built when the first track loads, and it reads the chosen output at
+    // construction. A restore still in flight at that moment means the opening
+    // seconds play on the system default and only then jump to the right
+    // speakers. Waiting here closes that window — a track cannot be started
+    // before the first frame.
+    //
+    // Bounded, because a wedged audio backend must not hold the window shut:
+    // past the deadline launch continues and the restore lands whenever the
+    // backend answers, moving live playback then. It is owned either way, so
+    // shutdown still waits for it.
+    //
+    // Cheap by design when there is nothing to restore: the controller does not
+    // probe the backend just to confirm the system default, and off Linux the
+    // seam is a no-op that never loads libmpv at all — in both cases this
+    // returns without touching anything.
+    final Future<void> audioOutputRestored = _restoreAudioOutput(container);
+    handle.ownPendingWork(audioOutputRestored);
+    try {
+      await audioOutputRestored.timeout(_audioOutputRestoreDeadline);
+    } on TimeoutException {
+      // Deliberately ignored: see above.
+    }
+
     // Warm the persisted sessions before the first frame so a synced remote
     // track can stream on the first tap. Best-effort and secret-free: a
     // missing/corrupt record loads as "not connected".
@@ -231,6 +311,9 @@ Future<ApplicationHandle> bootstrapApplication(
       container.read(jellyfinSettingsControllerProvider.notifier).ensureLoaded,
       container.read(subsonicSettingsControllerProvider.notifier).ensureLoaded,
       container.read(plexSettingsControllerProvider.notifier).ensureLoaded,
+      container
+          .read(audiobookshelfSettingsControllerProvider.notifier)
+          .ensureLoaded,
     ]) {
       try {
         await ensureLoaded();
@@ -290,6 +373,12 @@ Future<ApplicationHandle> bootstrapApplication(
     unawaited(container.read(favoritesRepositoryProvider).refreshFromRemote());
     unawaited(container.read(playlistRepositoryProvider).refreshFromRemote());
 
+    // Desktop volume: come back at the level the listener left, before anything
+    // can play. Never blocks launch, and never restores a mute.
+    final PlaybackVolumePersistence? volumePersistence =
+        container.read(playbackVolumePersistenceProvider);
+    if (volumePersistence != null) await volumePersistence.restore();
+
     // Linux crash-safe restore: rehydrate any persisted logical queue as a
     // paused/resumable state. Never autoplay, and never block launch on a bad
     // record.
@@ -310,5 +399,26 @@ Future<ApplicationHandle> bootstrapApplication(
     // caller sees.
     await handle.shutdown();
     Error.throwWithStackTrace(error, stackTrace);
+  }
+}
+
+/// How long launch waits for a saved audio output to be re-applied.
+///
+/// libmpv publishes its device list while a player initializes, so the normal
+/// cost of this is milliseconds. The deadline exists for the backend that never
+/// answers at all, and is shorter than the enumeration timeout underneath it so
+/// the wait is bounded by *this* value rather than by that one.
+const Duration _audioOutputRestoreDeadline = Duration(milliseconds: 1500);
+
+/// Builds the audio-output controller, which re-applies a saved output device.
+///
+/// Failure is swallowed on purpose: an audio backend that will not answer must
+/// never break launch, and the fallback — the system default — is exactly what
+/// the app does without this.
+Future<void> _restoreAudioOutput(ProviderContainer container) async {
+  try {
+    await container.read(audioOutputControllerProvider.future);
+  } catch (_) {
+    // Ignore: playback stays on the system default.
   }
 }

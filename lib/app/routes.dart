@@ -28,6 +28,11 @@ abstract final class AppRoutes {
   static String artistDetailPath(String id) =>
       '$artistDetail/${Uri.encodeComponent(id)}';
 
+  /// Server folder browsing (Jellyfin, Navidrome/Subsonic), a top-level
+  /// destination of its own so a folder you were deep inside is still open when
+  /// you come back to it from another tab.
+  static const String folders = '/folders';
+
   static const String playlists = '/playlists';
 
   /// Liked tracks, reached from the Playlists tab. A child of [playlists] so it
@@ -60,6 +65,12 @@ abstract final class AppRoutes {
   /// "Connections" — the music-source connections (Jellyfin, Plex,
   /// Navidrome/Subsonic, local files). A child of [settings].
   static const String settingsConnections = '/settings/connections';
+
+  /// The audiobook browser for a connected Audiobookshelf server. Reached
+  /// from the connection card on [settingsConnections], so it is a child of
+  /// [settings] and keeps the bottom nav. It lives here only until Audiobooks
+  /// gets its own destination (its own change, agreed on issue #484).
+  static const String audiobooks = '/settings/audiobooks';
 
   /// "Music & playback" — default source and playback behaviour. A child of
   /// [settings].

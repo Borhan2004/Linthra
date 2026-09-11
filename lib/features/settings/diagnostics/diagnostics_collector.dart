@@ -15,12 +15,15 @@ import '../../../core/sources/local/audio_file_types.dart';
 import '../../../core/sources/local/folder_location.dart';
 import '../../../core/sources/local/local_scan_diagnostics.dart';
 import '../../../core/sources/local/local_scan_report.dart';
+import '../../../core/sources/source_availability.dart';
 import '../../../data/repositories/music_library_repository_provider.dart';
 import '../../../data/repositories/selected_music_folder_repository_provider.dart';
 import '../../downloads/download_providers.dart';
 import '../../library/library_providers.dart';
+import '../../library/source_availability_providers.dart';
 import '../../player/cast/cast_providers.dart';
 import '../../player/player_providers.dart';
+import '../jellyfin/jellyfin_availability_controller.dart';
 import '../jellyfin/jellyfin_settings_controller.dart';
 import '../jellyfin/jellyfin_settings_state.dart';
 import '../subsonic/subsonic_settings_controller.dart';
@@ -58,11 +61,15 @@ class DiagnosticsCollector {
     // Local-folder scan diagnostics: whether a folder is selected, whether a
     // persisted SAF grant is still held for it (the removable-SD-card signal),
     // and the counts from the last scan. All secret-free — never the path/URI.
-    final String? selectedFolder = await _selectedFolder();
-    final bool folderSelected =
-        selectedFolder != null && selectedFolder.isNotEmpty;
+    // Only the first folder is probed for a SAF grant: content URIs are the
+    // Android case, and Android holds exactly one local selection. How many
+    // folders a desktop library spans is carried by the scan report's own
+    // counts, never as paths.
+    final List<String> selectedFolders = await _selectedFolders();
+    final String? selectedFolder =
+        selectedFolders.isEmpty ? null : selectedFolders.first;
+    final bool folderSelected = selectedFolders.isNotEmpty;
     final bool isContentFolder = selectedFolder != null &&
-        selectedFolder.isNotEmpty &&
         FolderLocation.parse(selectedFolder).isContentUri;
     final bool? persistedPermission =
         await _persistedPermission(selectedFolder, isContentFolder);
@@ -74,11 +81,15 @@ class DiagnosticsCollector {
       // No device-model plugin is bundled, so this stays null rather than a
       // guess; the report omits the line entirely when absent.
       deviceModel: null,
-      jellyfinState: _jellyfinStateLabel(jellyfin.phase),
+      jellyfinState: _jellyfinStateLabel(
+        jellyfin.phase,
+        _ref.read(jellyfinAvailabilityProvider).status,
+      ),
       jellyfinHost: jellyfin.baseUrl,
       subsonicState: _subsonicStateLabel(subsonic),
       subsonicHost: subsonic.baseUrl,
       libraryTrackCount: await _libraryTrackCount(),
+      unavailableTrackCount: _unavailableTrackCount(),
       localFolderSelected: folderSelected,
       localPersistedPermission: persistedPermission,
       localScanFilesVisited: scan?.filesVisited,
@@ -130,10 +141,21 @@ class DiagnosticsCollector {
 
   bool _androidAutoSupported() => Platform.isAndroid;
 
-  String _jellyfinStateLabel(JellyfinConnectionPhase phase) {
+  /// The Jellyfin line, reporting **reachability**, not just configuration.
+  ///
+  /// The old version returned `connected` for any saved session, which is how a
+  /// report could read "Jellyfin: connected" beside "Playback state: error" for a
+  /// LAN-only server the phone was nowhere near. A configured session now only
+  /// says `connected` when a probe actually reached the server and it accepted
+  /// the session; otherwise the line names what is really wrong, and says the
+  /// connection is still *configured* so nobody reads it as "signed out".
+  String _jellyfinStateLabel(
+    JellyfinConnectionPhase phase,
+    SourceAvailability availability,
+  ) {
     switch (phase) {
       case JellyfinConnectionPhase.connected:
-        return 'connected';
+        return configuredSourceAvailabilityLabel(availability);
       case JellyfinConnectionPhase.tested:
         return 'tested (not signed in)';
       case JellyfinConnectionPhase.testing:
@@ -165,6 +187,16 @@ class DiagnosticsCollector {
     }
   }
 
+  /// How many stored tracks are currently hidden because their source is
+  /// unreachable. Best-effort: never let it break the report.
+  int? _unavailableTrackCount() {
+    try {
+      return _ref.read(unavailableTrackCountProvider);
+    } catch (_) {
+      return null;
+    }
+  }
+
   Future<int?> _libraryTrackCount() async {
     try {
       final tracks =
@@ -176,16 +208,16 @@ class DiagnosticsCollector {
     }
   }
 
-  /// The selected music folder path/URI, read best-effort. Used only to derive
-  /// the secret-free "selected / not selected" and persisted-permission flags —
-  /// the value itself never reaches the report.
-  Future<String?> _selectedFolder() async {
+  /// The selected music folder paths/URIs, read best-effort. Used only to
+  /// derive the secret-free "selected / not selected" and persisted-permission
+  /// flags — the values themselves never reach the report.
+  Future<List<String>> _selectedFolders() async {
     try {
       return await _ref
           .read(selectedMusicFolderRepositoryProvider)
-          .getSelectedFolder();
+          .getSelectedFolders();
     } catch (_) {
-      return null;
+      return <String>[];
     }
   }
 

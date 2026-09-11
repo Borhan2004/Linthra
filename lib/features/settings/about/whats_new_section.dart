@@ -20,10 +20,11 @@ class WhatsNewSection extends StatelessWidget {
   /// handful of concise bullets and updated when cutting a new build; exposed so
   /// the widget test can assert each line renders without duplicating the copy.
   static const List<String> releaseNotes = <String>[
-    'Linux playback now recovers more reliably from network/server drops and suspend/resume.',
-    'Linux can restore the previous queue and position safely after an unexpected restart, without autoplay.',
-    'Audiobookshelf connection, authentication, and library support has started with the first integration milestone.',
-    'Self-hosted server URLs, IPv6 handling, source re-sync performance, and desktop defaults are improved.',
+    'Casting is temporarily turned off while a security fix is finished. Local playback, downloads and your servers are unaffected, and your queue and settings are unchanged.',
+    'On Android, picking a large music folder no longer freezes the app while it scans.',
+    'On Linux, media keys and your desktop\'s media controls now drive Linthra, and it shows up in the lock screen and media applets.',
+    'Local files on Linux now show their real title, artist, album and duration instead of the file name.',
+    'Linux playback no longer leaves a stray cache file behind or logs errors when it cannot write one.',
   ];
 
   @override

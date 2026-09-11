@@ -4,10 +4,15 @@ import 'package:go_router/go_router.dart';
 
 import '../../app/routes.dart';
 import '../../core/models/playlist.dart';
+import '../../core/models/track.dart';
 import '../../data/repositories/playlist_repository_provider.dart';
+import '../../shared/layout/adaptive_layout.dart';
 import '../../shared/widgets/confirm_dialog.dart';
+import '../../shared/widgets/context_menu_region.dart';
 import '../../shared/widgets/empty_state.dart';
 import '../library/remote_library_refresher.dart';
+import 'playlist_add.dart';
+import 'playlist_drag.dart';
 import 'playlist_providers.dart';
 import 'widgets/create_playlist_dialog.dart';
 
@@ -52,45 +57,49 @@ class _PlaylistsScreenState extends ConsumerState<PlaylistsScreen> {
         icon: const Icon(Icons.add),
         label: const Text('New playlist'),
       ),
-      body: Column(
-        children: <Widget>[
-          ListTile(
-            leading: CircleAvatar(
-              backgroundColor: accent.withValues(alpha: 0.12),
-              child: Icon(Icons.favorite, color: accent),
+      // Rows of one playlist each: capped and centred on a wide window rather
+      // than stretched edge to edge.
+      body: AdaptiveContentWidth(
+        child: Column(
+          children: <Widget>[
+            ListTile(
+              leading: CircleAvatar(
+                backgroundColor: accent.withValues(alpha: 0.12),
+                child: Icon(Icons.favorite, color: accent),
+              ),
+              title: const Text('Favorites'),
+              subtitle: const Text('Tracks you’ve liked'),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () => context.push(AppRoutes.favorites),
             ),
-            title: const Text('Favorites'),
-            subtitle: const Text('Tracks you’ve liked'),
-            trailing: const Icon(Icons.chevron_right),
-            onTap: () => context.push(AppRoutes.favorites),
-          ),
-          const Divider(height: 0),
-          ListTile(
-            leading: CircleAvatar(
-              backgroundColor: accent.withValues(alpha: 0.12),
-              child: Icon(Icons.auto_awesome, color: accent),
+            const Divider(height: 0),
+            ListTile(
+              leading: CircleAvatar(
+                backgroundColor: accent.withValues(alpha: 0.12),
+                child: Icon(Icons.auto_awesome, color: accent),
+              ),
+              title: const Text('Smart mixes'),
+              subtitle: const Text('Made by Linthra'),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () => context.push(AppRoutes.smartMixes),
             ),
-            title: const Text('Smart mixes'),
-            subtitle: const Text('Made by Linthra'),
-            trailing: const Icon(Icons.chevron_right),
-            onTap: () => context.push(AppRoutes.smartMixes),
-          ),
-          const Divider(height: 0),
-          Expanded(
-            child: playlists.when(
-              loading: () => const Center(child: CircularProgressIndicator()),
-              error: (_, __) => const _PlaylistsError(),
-              data: (List<Playlist> items) => items.isEmpty
-                  ? _PlaylistsEmpty(serverConnected: serverConnected)
-                  : ListView.builder(
-                      padding: const EdgeInsets.only(bottom: 88),
-                      itemCount: items.length,
-                      itemBuilder: (context, index) =>
-                          _PlaylistTile(playlist: items[index]),
-                    ),
+            const Divider(height: 0),
+            Expanded(
+              child: playlists.when(
+                loading: () => const Center(child: CircularProgressIndicator()),
+                error: (_, __) => const _PlaylistsError(),
+                data: (List<Playlist> items) => items.isEmpty
+                    ? _PlaylistsEmpty(serverConnected: serverConnected)
+                    : ListView.builder(
+                        padding: const EdgeInsets.only(bottom: 88),
+                        itemCount: items.length,
+                        itemBuilder: (context, index) =>
+                            _PlaylistTile(playlist: items[index]),
+                      ),
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -119,45 +128,90 @@ class _PlaylistTile extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final ThemeData theme = Theme.of(context);
-    return ListTile(
-      leading: CircleAvatar(
-        backgroundColor: theme.colorScheme.primary.withValues(alpha: 0.12),
-        child: Icon(
-          playlist.isRemote ? Icons.cloud_outlined : Icons.queue_music,
-          color: theme.colorScheme.primary,
+    // The same two actions the trailing button offers, on right-click and on
+    // the keyboard's menu key (#386). Rename and delete are all the domain
+    // layer supports for a playlist from here, so that is all the menu claims.
+    final Widget row = ContextMenuRegion<_PlaylistMenuAction>(
+      itemBuilder: (BuildContext context) => _menuItems(),
+      onSelected: (action) => _run(context, ref, action),
+      child: ListTile(
+        leading: CircleAvatar(
+          backgroundColor: theme.colorScheme.primary.withValues(alpha: 0.12),
+          child: Icon(
+            playlist.isRemote ? Icons.cloud_outlined : Icons.queue_music,
+            color: theme.colorScheme.primary,
+          ),
+        ),
+        title: Text(
+          playlist.name,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+        ),
+        subtitle: Text(_subtitle()),
+        trailing: PopupMenuButton<_PlaylistMenuAction>(
+          icon: const Icon(Icons.more_vert),
+          tooltip: 'Playlist actions',
+          onSelected: (action) => _run(context, ref, action),
+          itemBuilder: (context) => _menuItems(),
+        ),
+        onTap: () => context.push(AppRoutes.playlistDetailPath(playlist.id)),
+      ),
+    );
+    // Dropping tracks here adds them (#389). The row is the clear target the
+    // issue asks for: it is the playlist, named, with its song count.
+    return PlaylistDropRegion(
+      playlist: playlist,
+      onDrop: (List<Track> tracks) => _addDropped(context, ref, tracks),
+      onRefused: (String message) => _say(context, message),
+      builder: (BuildContext context, PlaylistDropState state) =>
+          PlaylistDropHighlight(state: state, child: row),
+    );
+  }
+
+  /// Adds dropped tracks through the same plan the "Add to playlist" sheet
+  /// uses, so a drop can never put a track in a playlist the sheet would have
+  /// refused, and reports what actually landed.
+  Future<void> _addDropped(
+    BuildContext context,
+    WidgetRef ref,
+    List<Track> tracks,
+  ) async {
+    final ScaffoldMessengerState messenger = ScaffoldMessenger.of(context);
+    final PlaylistAddPlan plan = await addTracksToPlaylist(
+      repository: ref.read(playlistRepositoryProvider),
+      playlist: playlist,
+      tracks: tracks,
+    );
+    messenger.showSnackBar(SnackBar(content: Text(plan.resultMessage)));
+  }
+
+  void _say(BuildContext context, String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message)),
+    );
+  }
+
+  /// One list for both the button and the right-click menu, so they can never
+  /// offer different things.
+  List<PopupMenuEntry<_PlaylistMenuAction>> _menuItems() {
+    return const <PopupMenuEntry<_PlaylistMenuAction>>[
+      PopupMenuItem<_PlaylistMenuAction>(
+        value: _PlaylistMenuAction.rename,
+        child: ListTile(
+          contentPadding: EdgeInsets.zero,
+          leading: Icon(Icons.edit_outlined),
+          title: Text('Rename'),
         ),
       ),
-      title: Text(
-        playlist.name,
-        maxLines: 1,
-        overflow: TextOverflow.ellipsis,
+      PopupMenuItem<_PlaylistMenuAction>(
+        value: _PlaylistMenuAction.delete,
+        child: ListTile(
+          contentPadding: EdgeInsets.zero,
+          leading: Icon(Icons.delete_outline),
+          title: Text('Delete'),
+        ),
       ),
-      subtitle: Text(_subtitle()),
-      trailing: PopupMenuButton<_PlaylistMenuAction>(
-        icon: const Icon(Icons.more_vert),
-        tooltip: 'Playlist actions',
-        onSelected: (action) => _run(context, ref, action),
-        itemBuilder: (context) => const <PopupMenuEntry<_PlaylistMenuAction>>[
-          PopupMenuItem<_PlaylistMenuAction>(
-            value: _PlaylistMenuAction.rename,
-            child: ListTile(
-              contentPadding: EdgeInsets.zero,
-              leading: Icon(Icons.edit_outlined),
-              title: Text('Rename'),
-            ),
-          ),
-          PopupMenuItem<_PlaylistMenuAction>(
-            value: _PlaylistMenuAction.delete,
-            child: ListTile(
-              contentPadding: EdgeInsets.zero,
-              leading: Icon(Icons.delete_outline),
-              title: Text('Delete'),
-            ),
-          ),
-        ],
-      ),
-      onTap: () => context.push(AppRoutes.playlistDetailPath(playlist.id)),
-    );
+    ];
   }
 
   /// "{n} songs", with a subtle source/status suffix: "· Sync failed" when a

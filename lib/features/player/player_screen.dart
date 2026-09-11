@@ -6,6 +6,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../app/dimens.dart';
 import '../../core/models/playback_state.dart';
 import '../../core/models/track.dart';
+import '../../data/repositories/host_platform_provider.dart';
+import '../../shared/layout/adaptive_layout.dart';
 import '../../shared/widgets/empty_state.dart';
 import 'cast/cast_button.dart';
 import 'cast/cast_providers.dart';
@@ -17,7 +19,9 @@ import 'widgets/now_playing_actions.dart';
 import 'widgets/now_playing_background.dart';
 import 'widgets/playback_controls.dart';
 import 'widgets/playback_progress_bar.dart';
+import 'widgets/queue_sheet.dart';
 import 'widgets/track_metadata.dart';
+import 'widgets/volume_controls.dart';
 
 /// Full-screen now-playing view. Renders from [playbackStateProvider] and drives
 /// playback through the [PlaybackController]; it never touches the audio engine,
@@ -129,6 +133,17 @@ class _NowPlaying extends StatefulWidget {
 }
 
 class _NowPlayingState extends State<_NowPlaying> {
+  /// How wide a queue pane is drawn. Wide enough for a title, a duration and a
+  /// drag handle without the title truncating on most songs.
+  static const double _queuePaneWidth = 340;
+
+  /// The narrowest the screen may be and still host the queue as a third
+  /// column: the pane's own width, plus enough left over that the cover and the
+  /// controls beside it are no tighter than they are at the bottom of the
+  /// two-column layout.
+  static const double _queuePaneMinWidth =
+      expandedWindowWidth + _queuePaneWidth + AppSpacing.lg;
+
   /// Whether the stage is showing lyrics instead of the cover.
   ///
   /// Deliberately kept across track changes: someone reading along wants the
@@ -137,54 +152,232 @@ class _NowPlayingState extends State<_NowPlaying> {
   /// with dragging the seek bar.
   bool _showLyrics = false;
 
+  /// Whether the queue is open as a pane beside the cover.
+  ///
+  /// Remembered even while the window is too narrow to draw it, so dragging a
+  /// window down to a phone width and back finds the queue where it was left
+  /// rather than closed.
+  bool _showQueue = false;
+
   @override
   Widget build(BuildContext context) {
-    final Track track = widget.track;
-    // A tighter side margin lets the artwork breathe wider and gives the
-    // transport controls more room to spread, while the generous gaps below
-    // group the screen into three calm bands: stage · metadata · controls.
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(
-        AppSpacing.md,
-        AppSpacing.sm,
-        AppSpacing.md,
-        AppSpacing.lg,
-      ),
-      child: Column(
-        children: [
-          Expanded(child: _Stage(track: track, showLyrics: _showLyrics)),
-          // Lyrics need the height more than the gap does; the artwork keeps
-          // its generous breathing room.
-          SizedBox(height: _showLyrics ? AppSpacing.md : AppSpacing.xl),
-          // In lyrics mode the three-line metadata block collapses to a single
-          // quiet line, handing the difference to the lyrics above without
-          // losing track of what is playing.
-          if (_showLyrics)
-            _CompactTrackLine(
-              title: track.title,
-              artistName: track.artistName,
-            )
-          else
-            TrackMetadata(
-              title: track.title,
-              artistName: track.artistName,
-              albumName: track.albumName,
-            ),
-          SizedBox(height: _showLyrics ? AppSpacing.md : AppSpacing.lg),
-          // The only part of the screen that follows the live, high-frequency
-          // playback state — kept separate so the stage, metadata, and the
-          // blurred background above never rebuild on a position tick. It stays
-          // exactly where it is in both modes, so play/pause, skip, and seek are
-          // never further away for reading lyrics.
-          const _LiveControls(),
-          const SizedBox(height: AppSpacing.md),
-          NowPlayingActions(
-            track: track,
-            lyricsVisible: _showLyrics,
-            onToggleLyrics: () => setState(() => _showLyrics = !_showLyrics),
+    return AdaptiveLayoutBuilder(
+      builder: (
+        BuildContext context,
+        BoxConstraints constraints,
+        WindowSizeClass sizeClass,
+      ) {
+        // Width alone decides, so the same window is laid out the same way on
+        // any platform — and the side-by-side layout is the *more* forgiving of
+        // the two vertically, since the cover shrinks beside the controls
+        // instead of stacking on top of them.
+        final bool wide = sizeClass.isAtLeast(WindowSizeClass.expanded);
+        // A third column has to earn its place: at the low end of `expanded`
+        // the cover and the controls are already using the width, and a queue
+        // squeezed in beside them would shrink both to make room for a list
+        // that is one tap away as a sheet.
+        final bool canHostQueue =
+            wide && constraints.maxWidth >= _queuePaneMinWidth;
+        return Padding(
+          padding: const EdgeInsets.fromLTRB(
+            AppSpacing.md,
+            AppSpacing.sm,
+            AppSpacing.md,
+            AppSpacing.lg,
           ),
-        ],
+          child:
+              wide ? _wideLayout(canHostQueue: canHostQueue) : _stackedLayout(),
+        );
+      },
+    );
+  }
+
+  /// Desktop-width Now Playing: the cover holds one side while metadata,
+  /// transport and actions sit on the other — and lyrics open *beside* the
+  /// cover instead of replacing it, which is the whole point of the extra
+  /// width. Same widgets, same `_showLyrics`, same playback state as the
+  /// stacked layout; only the arrangement differs.
+  ///
+  /// Wider still ([canHostQueue]) the queue joins them as a third column rather
+  /// than as a sheet over the top, so lyrics and up-next are readable at the
+  /// same time — which is the other thing the width is for. It is the same
+  /// [QueueSheet] the sheet shows, so a reorder or a jump behaves identically
+  /// whichever shape it is wearing.
+  Widget _wideLayout({required bool canHostQueue}) {
+    final Track track = widget.track;
+    final bool queueOpen = canHostQueue && _showQueue;
+    return Center(
+      child: ConstrainedBox(
+        // Ultrawide windows stop stretching the columns apart here.
+        constraints: const BoxConstraints(maxWidth: maxPaneLayoutWidth),
+        child: Row(
+          children: <Widget>[
+            Expanded(
+              flex: 5,
+              child: Center(child: _ArtworkHero(artworkUri: track.artworkUri)),
+            ),
+            const SizedBox(width: AppSpacing.xl),
+            Expanded(
+              flex: 4,
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: <Widget>[
+                  if (_showLyrics) ...<Widget>[
+                    const Expanded(
+                      child: LyricsBackdrop(child: LyricsView()),
+                    ),
+                    const SizedBox(height: AppSpacing.lg),
+                  ],
+                  TrackMetadata(
+                    title: track.title,
+                    artistName: track.artistName,
+                    albumName: track.albumName,
+                  ),
+                  const SizedBox(height: AppSpacing.lg),
+                  const _LiveControls(),
+                  const SizedBox(height: AppSpacing.md),
+                  _ActionsBar(
+                    track: track,
+                    lyricsVisible: _showLyrics,
+                    onToggleLyrics: _toggleLyrics,
+                    // Below the pane width the button keeps opening the sheet,
+                    // so the queue is never unreachable at any window size.
+                    queueVisible: queueOpen,
+                    onToggleQueue: canHostQueue ? _toggleQueue : null,
+                  ),
+                ],
+              ),
+            ),
+            if (queueOpen) ...<Widget>[
+              const SizedBox(width: AppSpacing.lg),
+              // A fixed width, not a flex share: the queue is a list of song
+              // rows, and rows have a width that reads well. Letting it grow
+              // with the window would only pull each title away from its
+              // handle, and would take the space from the cover.
+              const SizedBox(
+                width: _queuePaneWidth,
+                child: QueueSheet(embedded: true),
+              ),
+            ],
+          ],
+        ),
       ),
+    );
+  }
+
+  void _toggleLyrics() => setState(() => _showLyrics = !_showLyrics);
+
+  void _toggleQueue() => setState(() => _showQueue = !_showQueue);
+
+  /// Phones, and any window without the width (or height) for two columns.
+  ///
+  /// A tighter side margin lets the artwork breathe wider and gives the
+  /// transport controls more room to spread, while the generous gaps below
+  /// group the screen into three calm bands: stage · metadata · controls.
+  Widget _stackedLayout() {
+    final Track track = widget.track;
+    return Column(
+      children: [
+        Expanded(child: _Stage(track: track, showLyrics: _showLyrics)),
+        // Lyrics need the height more than the gap does; the artwork keeps
+        // its generous breathing room.
+        SizedBox(height: _showLyrics ? AppSpacing.md : AppSpacing.xl),
+        // In lyrics mode the three-line metadata block collapses to a single
+        // quiet line, handing the difference to the lyrics above without
+        // losing track of what is playing.
+        if (_showLyrics)
+          _CompactTrackLine(
+            title: track.title,
+            artistName: track.artistName,
+          )
+        else
+          TrackMetadata(
+            title: track.title,
+            artistName: track.artistName,
+            albumName: track.albumName,
+          ),
+        SizedBox(height: _showLyrics ? AppSpacing.md : AppSpacing.lg),
+        // The only part of the screen that follows the live, high-frequency
+        // playback state — kept separate so the stage, metadata, and the
+        // blurred background above never rebuild on a position tick. It stays
+        // exactly where it is in both modes, so play/pause, skip, and seek are
+        // never further away for reading lyrics.
+        const _LiveControls(),
+        const SizedBox(height: AppSpacing.md),
+        _ActionsBar(
+          track: track,
+          lyricsVisible: _showLyrics,
+          onToggleLyrics: _toggleLyrics,
+        ),
+      ],
+    );
+  }
+}
+
+/// The action row, plus the desktop volume control beside it.
+///
+/// They share one band on purpose: volume is a secondary control here (the
+/// transport above it is what the screen is for), and giving it a row of its own
+/// would take height from the artwork and the lyrics — which a short window at a
+/// large text scale does not have to spare.
+///
+/// The control is desktop-only: a phone's volume is the system's, set with its
+/// hardware keys, so mobile keeps exactly the row it had. It also steps aside
+/// while casting, where the level that matters belongs to the receiver and the
+/// cast sheet already owns it, and on a desktop window too narrow to hold both
+/// it and the five actions — a slider squeezing the queue button off the edge
+/// is worse than no slider.
+class _ActionsBar extends ConsumerWidget {
+  /// The narrowest band that holds the five actions and the volume control
+  /// without squeezing either. Measured against the band itself, not the
+  /// window: in the two-column layout this row lives in the narrower half.
+  static const double _volumeBandMinWidth = 460;
+
+  const _ActionsBar({
+    required this.track,
+    required this.lyricsVisible,
+    required this.onToggleLyrics,
+    this.queueVisible = false,
+    this.onToggleQueue,
+  });
+
+  final Track track;
+  final bool lyricsVisible;
+  final VoidCallback onToggleLyrics;
+
+  /// Whether the screen is hosting the queue as a pane, and how to toggle it.
+  /// Null on the layouts that have no room for one, which leaves the queue
+  /// button opening its sheet.
+  final bool queueVisible;
+  final VoidCallback? onToggleQueue;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final Widget actions = NowPlayingActions(
+      track: track,
+      lyricsVisible: lyricsVisible,
+      onToggleLyrics: onToggleLyrics,
+      queueVisible: queueVisible,
+      onToggleQueue: onToggleQueue,
+    );
+    // Falls back to the service's own state until the first stream event, the
+    // same way the source/casting line does.
+    final bool casting = ref.watch(
+          castStateProvider.select((s) => s.valueOrNull?.isConnected),
+        ) ??
+        ref.watch(castServiceProvider).state.isConnected;
+    if (casting || !ref.watch(hostPlatformProvider).isDesktop) return actions;
+
+    return LayoutBuilder(
+      builder: (BuildContext context, BoxConstraints constraints) {
+        if (constraints.maxWidth < _volumeBandMinWidth) return actions;
+        return Row(
+          children: <Widget>[
+            Expanded(child: actions),
+            const VolumeControls(),
+          ],
+        );
+      },
     );
   }
 }

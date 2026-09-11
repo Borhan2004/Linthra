@@ -7,16 +7,22 @@ import '../../app/routes.dart';
 import '../../core/models/playlist.dart';
 import '../../core/models/track.dart';
 import '../../core/services/bulk_track_actions.dart';
+import '../../data/repositories/download_repository_provider.dart';
 import '../../data/repositories/favorites_repository_provider.dart';
 import '../../data/repositories/playlist_repository_provider.dart';
 import '../../shared/widgets/confirm_dialog.dart';
 import '../../shared/widgets/empty_state.dart';
+import '../../shared/widgets/reorder_focus_walk.dart';
+import '../../shared/widgets/reorder_handle.dart';
+import '../downloads/collection_download_actions.dart';
 import '../library/song_actions.dart';
 import '../player/favorites_providers.dart';
 import '../player/now_playing.dart';
 import '../player/player_providers.dart';
 import '../player/widgets/album_artwork.dart';
 import '../player/widgets/track_artwork.dart';
+import 'playlist_add.dart';
+import 'playlist_drag.dart';
 import 'playlist_providers.dart';
 import 'widgets/add_to_playlist_sheet.dart';
 import 'widgets/create_playlist_dialog.dart';
@@ -62,6 +68,11 @@ class _PlaylistDetailScreenState extends ConsumerState<PlaylistDetailScreen> {
       for (final Track track in resolved.tracks)
         if (_selectedIds.contains(track.uri)) track,
     ];
+    // "Download all" is offered only when something here actually streams from
+    // a server: an all-local playlist is already on disk, and the per-track menu
+    // hides offline actions for those rows for the same reason.
+    final bool canDownloadAll =
+        resolved.tracks.any(ref.watch(remoteTrackDownloaderProvider).isRemote);
 
     return PopScope(
       canPop: !_selecting,
@@ -82,8 +93,8 @@ class _PlaylistDetailScreenState extends ConsumerState<PlaylistDetailScreen> {
                     tooltip: 'Playlist actions',
                     onSelected: (a) => _runMenu(playlist, a),
                     itemBuilder: (context) =>
-                        const <PopupMenuEntry<_DetailMenuAction>>[
-                      PopupMenuItem<_DetailMenuAction>(
+                        <PopupMenuEntry<_DetailMenuAction>>[
+                      const PopupMenuItem<_DetailMenuAction>(
                         value: _DetailMenuAction.rename,
                         child: ListTile(
                           contentPadding: EdgeInsets.zero,
@@ -91,7 +102,21 @@ class _PlaylistDetailScreenState extends ConsumerState<PlaylistDetailScreen> {
                           title: Text('Rename'),
                         ),
                       ),
-                      PopupMenuItem<_DetailMenuAction>(
+                      if (canDownloadAll) ...<PopupMenuEntry<
+                          _DetailMenuAction>>[
+                        const PopupMenuItem<_DetailMenuAction>(
+                          value: _DetailMenuAction.downloadAll,
+                          child: ListTile(
+                            contentPadding: EdgeInsets.zero,
+                            leading: Icon(Icons.download_outlined),
+                            title: Text('Download all'),
+                          ),
+                        ),
+                        // Keeps the destructive entry a deliberate reach away
+                        // from the new one directly above it.
+                        const PopupMenuDivider(),
+                      ],
+                      const PopupMenuItem<_DetailMenuAction>(
                         value: _DetailMenuAction.delete,
                         child: ListTile(
                           contentPadding: EdgeInsets.zero,
@@ -103,16 +128,55 @@ class _PlaylistDetailScreenState extends ConsumerState<PlaylistDetailScreen> {
                   ),
                 ],
               ),
-        body: tracksAsync.when(
-          loading: () => const Center(child: CircularProgressIndicator()),
-          error: (_, __) => const EmptyState(
-            icon: Icons.error_outline,
-            title: "Couldn't load this playlist",
-            message: 'Try again in a moment.',
-          ),
-          data: (PlaylistTracks data) => _content(playlist, data),
+        // The whole page takes a dropped track (#389), not just the list: the
+        // rail's spring can land a drag here rather than on the Playlists tab
+        // when this playlist was already open, and an empty playlist is
+        // exactly the one somebody wants to drag songs into.
+        body: PlaylistDropRegion(
+          playlist: playlist,
+          onDrop: (List<Track> tracks) => _addDropped(playlist, tracks),
+          onRefused: _say,
+          builder: (BuildContext context, PlaylistDropState state) {
+            return PlaylistDropHighlight(
+              state: state,
+              child: tracksAsync.when(
+                // Every edit — a reorder, a removal — re-runs the uri-to-Track
+                // resolution, and a spinner over the list on each one would
+                // both flash and tear down the reorder list's focus nodes
+                // mid-keyboard walk. Only the genuine first load shows the
+                // spinner.
+                skipLoadingOnReload: true,
+                loading: () => const Center(child: CircularProgressIndicator()),
+                error: (_, __) => const EmptyState(
+                  icon: Icons.error_outline,
+                  title: "Couldn't load this playlist",
+                  message: 'Try again in a moment.',
+                ),
+                data: (PlaylistTracks data) => _content(playlist, data),
+              ),
+            );
+          },
         ),
       ),
+    );
+  }
+
+  /// Adds dropped tracks to the open playlist, through the same plan the
+  /// "Add to playlist" sheet and the Playlists tab both use.
+  Future<void> _addDropped(Playlist playlist, List<Track> tracks) async {
+    final ScaffoldMessengerState messenger = ScaffoldMessenger.of(context);
+    final PlaylistAddPlan plan = await addTracksToPlaylist(
+      repository: ref.read(playlistRepositoryProvider),
+      playlist: playlist,
+      tracks: tracks,
+    );
+    if (!mounted) return;
+    messenger.showSnackBar(SnackBar(content: Text(plan.resultMessage)));
+  }
+
+  void _say(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message)),
     );
   }
 
@@ -165,9 +229,20 @@ class _PlaylistDetailScreenState extends ConsumerState<PlaylistDetailScreen> {
     );
   }
 
+  /// Ties the three list variants below to one saved scroll offset.
+  ///
+  /// Entering selection swaps a ReorderableListView for a plain ListView, which
+  /// mounts a fresh Scrollable and would otherwise drop the user back at the top
+  /// of a long playlist (#582). They are different widgets on purpose (a drag
+  /// handle has no place in selection mode), so the position is carried across
+  /// by PageStorage rather than by keeping one widget alive.
+  static const PageStorageKey<String> _listPosition =
+      PageStorageKey<String>('playlist_tracks');
+
   /// The plain checkbox list shown while selecting (no drag-to-reorder).
   Widget _selectionList(List<Track> tracks) {
     return ListView.builder(
+      key: _listPosition,
       itemCount: tracks.length,
       itemBuilder: (context, index) {
         final Track track = tracks[index];
@@ -207,28 +282,18 @@ class _PlaylistDetailScreenState extends ConsumerState<PlaylistDetailScreen> {
 
     if (!canReorder) {
       return ListView.builder(
+        key: _listPosition,
         itemCount: tracks.length,
-        itemBuilder: (context, index) =>
-            _trackRow(playlist, tracks, index, draggable: false),
+        itemBuilder: (context, index) => _trackRow(playlist, tracks, index),
       );
     }
 
-    return ReorderableListView.builder(
-      buildDefaultDragHandles: false,
-      itemCount: tracks.length,
-      onReorderItem: (int oldIndex, int newIndex) {
-        // The repository still accepts the legacy pre-removal insertion index.
-        // Flutter 3.44's onReorderItem gives the final destination index, so
-        // convert only at this boundary and keep persistence behaviour stable.
-        if (oldIndex < newIndex) newIndex += 1;
-        ref.read(playlistRepositoryProvider).reorderTracks(
-              playlist.id,
-              oldIndex,
-              newIndex,
-            );
-      },
-      itemBuilder: (context, index) =>
-          _trackRow(playlist, tracks, index, draggable: true),
+    return _ReorderableTrackList(
+      key: _listPosition,
+      playlistId: playlist.id,
+      tracks: tracks,
+      rowBuilder: (int index, Widget handle) =>
+          _trackRow(playlist, tracks, index, handle: handle),
     );
   }
 
@@ -236,7 +301,7 @@ class _PlaylistDetailScreenState extends ConsumerState<PlaylistDetailScreen> {
     Playlist playlist,
     List<Track> tracks,
     int index, {
-    required bool draggable,
+    Widget? handle,
   }) {
     final Track track = tracks[index];
     final NowPlayingRowState? nowPlaying =
@@ -306,14 +371,7 @@ class _PlaylistDetailScreenState extends ConsumerState<PlaylistDetailScreen> {
               ),
             ],
           ),
-          if (draggable)
-            ReorderableDragStartListener(
-              index: index,
-              child: const Padding(
-                padding: EdgeInsets.only(left: AppSpacing.xs),
-                child: Icon(Icons.drag_handle),
-              ),
-            ),
+          if (handle != null) handle,
         ],
       ),
       onTap: () => _playFrom(tracks, index),
@@ -416,6 +474,8 @@ class _PlaylistDetailScreenState extends ConsumerState<PlaylistDetailScreen> {
     switch (action) {
       case _DetailMenuAction.rename:
         await _rename(playlist);
+      case _DetailMenuAction.downloadAll:
+        await _downloadAll(playlist);
       case _DetailMenuAction.delete:
         await _deletePlaylist(playlist);
     }
@@ -459,6 +519,28 @@ class _PlaylistDetailScreenState extends ConsumerState<PlaylistDetailScreen> {
           edit.name,
           description: edit.description,
         );
+  }
+
+  /// Downloads every song currently in this playlist for offline use, through
+  /// the shared collection action (which confirms first and reuses the one
+  /// download repository, cache limit and network policy).
+  ///
+  /// The tracks are read here, when the action is chosen, rather than captured
+  /// when the menu was built, so a playlist that changed in between downloads
+  /// what it holds now.
+  Future<void> _downloadAll(Playlist playlist) async {
+    final List<Track> tracks = ref
+            .read(playlistTracksProvider(widget.playlistId))
+            .valueOrNull
+            ?.tracks ??
+        const <Track>[];
+    if (tracks.isEmpty) return;
+    await CollectionDownloadActions.downloadAll(
+      context,
+      ref,
+      label: playlist.name,
+      tracks: tracks,
+    );
   }
 
   Future<void> _deletePlaylist(Playlist playlist) async {
@@ -554,7 +636,125 @@ class _PlaylistDetailScreenState extends ConsumerState<PlaylistDetailScreen> {
   }
 }
 
-enum _DetailMenuAction { rename, delete }
+/// The playlist's drag-to-reorder list.
+///
+/// Its own widget for the same reason the queue's Up Next list is: keyboard
+/// reordering needs to know when the rows have caught up with a move, and
+/// `didUpdateWidget` on a list that is handed its tracks is the honest signal
+/// for that. Everything about *how* a row is reordered — the grab cursor, the
+/// lift, the Ctrl/Cmd + arrow chord, the screen-reader move actions — lives in
+/// the shared [ReorderHandle] and [ReorderFocusWalk], so the playlist editor
+/// and the queue cannot drift into two different gestures (#388, #389).
+///
+/// Every route (drag, chord, screen reader) lands on the same
+/// [PlaylistRepository.reorderTracks] call, so there is one persistence path
+/// rather than a keyboard copy of one. The repository writes locally first and
+/// never throws, so a server that refuses the new order leaves the local order
+/// applied and the playlist marked as failed to sync, rather than losing the
+/// edit.
+class _ReorderableTrackList extends ConsumerStatefulWidget {
+  const _ReorderableTrackList({
+    required this.playlistId,
+    required this.tracks,
+    required this.rowBuilder,
+    super.key,
+  });
+
+  final String playlistId;
+  final List<Track> tracks;
+
+  /// Builds the row at an index, handed the reorder handle to put in it.
+  final Widget Function(int index, Widget handle) rowBuilder;
+
+  @override
+  ConsumerState<_ReorderableTrackList> createState() =>
+      _ReorderableTrackListState();
+}
+
+class _ReorderableTrackListState extends ConsumerState<_ReorderableTrackList> {
+  final ReorderFocusWalk _walk =
+      ReorderFocusWalk(debugLabelPrefix: 'playlist-handle');
+
+  @override
+  void didUpdateWidget(_ReorderableTrackList oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // A reorder always resolves to a fresh list, so a changed identity means
+    // the rows now carry post-move indices and the walk has served its turn.
+    if (!identical(widget.tracks, oldWidget.tracks)) _walk.reset();
+  }
+
+  @override
+  void dispose() {
+    _walk.dispose();
+    super.dispose();
+  }
+
+  /// Moves the track at [from] to [to], both 0-based into the visible list,
+  /// [to] being the destination *after* removal.
+  ///
+  /// Out-of-range moves are dropped here as well as in the repository, so a
+  /// chord at either end of the list — or an index left stale by a playlist
+  /// that changed under the open screen — is simply harmless.
+  bool _move(int from, int to) {
+    final int count = widget.tracks.length;
+    if (from < 0 || from >= count) return false;
+    if (to < 0 || to >= count || to == from) return false;
+    // The repository still takes the legacy pre-removal insertion index, so a
+    // downward move is converted at this one boundary and persistence
+    // behaviour stays exactly what it was.
+    ref.read(playlistRepositoryProvider).reorderTracks(
+          widget.playlistId,
+          from,
+          to > from ? to + 1 : to,
+        );
+    return true;
+  }
+
+  /// The keyboard and screen-reader route: move the track the handle on row
+  /// [rowIndex] belongs to by [delta] positions.
+  void _moveBy(int rowIndex, int delta) {
+    final int from = _walk.sourceFor(rowIndex);
+    final int to = from + delta;
+    if (!_move(from, to)) return;
+    _walk.recordMove(rowIndex: rowIndex, to: to);
+    _walk.followTo(to, delta);
+  }
+
+  /// A pointer drop, carrying keyboard focus along with the row that held it.
+  /// Nothing happens when no handle has focus, so a plain mouse drag never
+  /// pulls focus into the list.
+  void _moveByPointer(int from, int to) {
+    final int focused = _walk.focusedIndex;
+    if (!_move(from, to)) return;
+    if (focused < 0) return;
+    _walk.followTo(
+      ReorderFocusWalk.positionAfterMove(focused, from: from, to: to),
+      to - from,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final List<Track> tracks = widget.tracks;
+    return ReorderableListView.builder(
+      buildDefaultDragHandles: false,
+      proxyDecorator: liftedReorderProxy,
+      itemCount: tracks.length,
+      onReorderItem: _moveByPointer,
+      itemBuilder: (BuildContext context, int index) => widget.rowBuilder(
+        index,
+        ReorderHandle(
+          index: index,
+          count: tracks.length,
+          focusNode: _walk.nodeAt(index),
+          onMoveBy: (int delta) => _moveBy(index, delta),
+        ),
+      ),
+    );
+  }
+}
+
+enum _DetailMenuAction { rename, downloadAll, delete }
 
 enum _RowAction {
   toggleFavorite,

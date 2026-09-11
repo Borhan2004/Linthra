@@ -2,13 +2,19 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../app/dimens.dart';
+import '../../../core/models/playback_history.dart';
 import '../../../core/models/playback_state.dart';
 import '../../../core/models/playlist.dart';
 import '../../../core/models/track.dart';
+import '../../../core/repositories/playlist_repository.dart';
+import '../../../data/repositories/host_platform_provider.dart';
 import '../../../data/repositories/playlist_repository_provider.dart';
 import '../../../shared/widgets/now_playing_indicator.dart';
+import '../../../shared/widgets/reorder_focus_walk.dart';
+import '../../../shared/widgets/reorder_handle.dart';
 import '../../playlists/widgets/create_playlist_dialog.dart';
 import '../now_playing.dart';
+import '../playback_history_providers.dart';
 import '../player_providers.dart';
 import 'album_artwork.dart';
 
@@ -28,6 +34,13 @@ Future<void> showQueueSheet(BuildContext context) {
 
 /// The Queue / Up Next manager.
 ///
+/// Hosted two ways. As a modal sheet ([showQueueSheet]) it keeps its own height
+/// budget and safe-area inset, the way a sheet has to. As an [embedded] pane —
+/// what a desktop-width Now Playing does with it — it fills whatever box the
+/// host gives it instead: the pane is already inside the screen's padding, and
+/// a sheet's 85%-of-the-window ceiling in a column that is the full window tall
+/// would leave a band of dead space under the list.
+///
 /// Reads the live [PlaybackState] (so it stays current while open) and shows,
 /// top to bottom: a header with Save/Clear actions, the played history, the
 /// current track, and the reorderable up-next list. Every edit goes through the
@@ -35,8 +48,22 @@ Future<void> showQueueSheet(BuildContext context) {
 /// Playing, Cast, and the media session use — so editing the queue here can
 /// never start a second, duplicate playback (local or cast). It only ever holds
 /// catalog [Track]s, never a resolved/authenticated stream URL.
+///
+/// **History differs by host, on purpose (#419).** As a sheet — which is what
+/// Android gets, at any window width — the history section is the current
+/// queue's own already-played prefix, unchanged: tapping a row steps back
+/// inside the queue. On a **desktop** pane the section is instead the session's
+/// bounded recent-playback history ([PlaybackHistory]), which survives the
+/// queue being replaced and is capped at [PlaybackHistory.defaultLimit]
+/// entries. It sits *below* Up next rather than above Now playing, because it
+/// is newest-first and is no longer part of the queue at all. Android's queue
+/// semantics are therefore untouched: the recorder that fills that history does
+/// not even run there.
 class QueueSheet extends ConsumerWidget {
-  const QueueSheet({super.key});
+  const QueueSheet({this.embedded = false, super.key});
+
+  /// Whether the host lays this out as a pane rather than a modal sheet.
+  final bool embedded;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -60,101 +87,119 @@ class QueueSheet extends ConsumerWidget {
     final Track? current = queue.$1;
     final List<Track> upNext = queue.$2;
     final List<Track> history = queue.$3;
-    final bool canClear = upNext.isNotEmpty || history.isNotEmpty;
+
+    // The desktop pane swaps the queue's already-played prefix for the
+    // session's bounded recent-playback history. Keyed on the host, not on the
+    // window width: a wide Android tablet still gets the queue semantics its
+    // phone sibling has.
+    final bool showRecentHistory =
+        embedded && ref.watch(hostPlatformProvider).isDesktop;
+    final PlaybackHistory recent = showRecentHistory
+        ? ref.watch(playbackHistoryProvider)
+        : PlaybackHistory.empty;
+
+    final bool canClear =
+        upNext.isNotEmpty || history.isNotEmpty || recent.isNotEmpty;
     final bool canSave = current != null;
 
+    final Widget body = Column(
+      mainAxisSize: embedded ? MainAxisSize.max : MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        Padding(
+          padding: const EdgeInsets.fromLTRB(
+            AppSpacing.lg,
+            0,
+            AppSpacing.sm,
+            AppSpacing.sm,
+          ),
+          child: Row(
+            children: <Widget>[
+              Icon(Icons.queue_music, color: theme.colorScheme.primary),
+              const SizedBox(width: AppSpacing.sm),
+              Text('Queue', style: theme.textTheme.titleMedium),
+              const Spacer(),
+              IconButton(
+                onPressed: canSave ? () => _saveAsPlaylist(context, ref) : null,
+                icon: const Icon(Icons.playlist_add),
+                tooltip: 'Save queue as playlist',
+              ),
+              TextButton(
+                onPressed: canClear
+                    ? () {
+                        controller.clearQueue();
+                        // Clear has always meant "drop what is behind and
+                        // ahead, keep what is playing". With history no longer
+                        // derived from the queue on desktop, clearing the queue
+                        // alone would leave half of that promise unkept.
+                        if (showRecentHistory) {
+                          ref.read(playbackHistoryProvider.notifier).clear();
+                        }
+                      }
+                    : null,
+                child: const Text('Clear'),
+              ),
+            ],
+          ),
+        ),
+        Flexible(
+          child: current == null
+              ? const _EmptyQueue()
+              : CustomScrollView(
+                  slivers: <Widget>[
+                    if (!showRecentHistory && history.isNotEmpty) ...<Widget>[
+                      const _SectionLabel(label: 'Previously played'),
+                      SliverList.builder(
+                        itemCount: history.length,
+                        itemBuilder: (context, index) => _HistoryTile(
+                          track: history[index],
+                          onTap: () => ref
+                              .read(playbackControllerProvider)
+                              .playFromHistory(index),
+                        ),
+                      ),
+                    ],
+                    const _SectionLabel(label: 'Now playing'),
+                    SliverToBoxAdapter(
+                      child: _CurrentTile(track: current),
+                    ),
+                    const _SectionLabel(label: 'Up next'),
+                    if (upNext.isEmpty)
+                      const SliverToBoxAdapter(child: _NothingUpNext())
+                    else
+                      _UpNextList(tracks: upNext),
+                    if (showRecentHistory && recent.isNotEmpty) ...<Widget>[
+                      const _SectionLabel(label: 'Recently played'),
+                      SliverList.builder(
+                        itemCount: recent.length,
+                        itemBuilder: (context, index) => _RecentlyPlayedTile(
+                          entry: recent.entries[index],
+                          onTap: () => playFromRecentHistory(
+                            ref,
+                            recent.entries[index].track,
+                          ),
+                        ),
+                      ),
+                      SliverToBoxAdapter(
+                        child: _RecentHistoryFootnote(limit: recent.limit),
+                      ),
+                    ],
+                    const SliverToBoxAdapter(
+                      child: SizedBox(height: AppSpacing.md),
+                    ),
+                  ],
+                ),
+        ),
+      ],
+    );
+
+    if (embedded) return body;
     return SafeArea(
       child: ConstrainedBox(
         constraints: BoxConstraints(
           maxHeight: MediaQuery.sizeOf(context).height * 0.85,
         ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: <Widget>[
-            Padding(
-              padding: const EdgeInsets.fromLTRB(
-                AppSpacing.lg,
-                0,
-                AppSpacing.sm,
-                AppSpacing.sm,
-              ),
-              child: Row(
-                children: <Widget>[
-                  Icon(Icons.queue_music, color: theme.colorScheme.primary),
-                  const SizedBox(width: AppSpacing.sm),
-                  Text('Queue', style: theme.textTheme.titleMedium),
-                  const Spacer(),
-                  IconButton(
-                    onPressed:
-                        canSave ? () => _saveAsPlaylist(context, ref) : null,
-                    icon: const Icon(Icons.playlist_add),
-                    tooltip: 'Save queue as playlist',
-                  ),
-                  TextButton(
-                    onPressed: canClear ? controller.clearQueue : null,
-                    child: const Text('Clear'),
-                  ),
-                ],
-              ),
-            ),
-            Flexible(
-              child: current == null
-                  ? const _EmptyQueue()
-                  : CustomScrollView(
-                      slivers: <Widget>[
-                        if (history.isNotEmpty) ...<Widget>[
-                          const _SectionLabel(label: 'Previously played'),
-                          SliverList.builder(
-                            itemCount: history.length,
-                            itemBuilder: (context, index) => _HistoryTile(
-                              track: history[index],
-                              onTap: () => ref
-                                  .read(playbackControllerProvider)
-                                  .playFromHistory(index),
-                            ),
-                          ),
-                        ],
-                        const _SectionLabel(label: 'Now playing'),
-                        SliverToBoxAdapter(
-                          child: _CurrentTile(track: current),
-                        ),
-                        const _SectionLabel(label: 'Up next'),
-                        if (upNext.isEmpty)
-                          const SliverToBoxAdapter(child: _NothingUpNext())
-                        else
-                          SliverReorderableList(
-                            itemCount: upNext.length,
-                            onReorderItem: (int oldIndex, int newIndex) {
-                              ref
-                                  .read(playbackControllerProvider)
-                                  .reorderQueue(oldIndex, newIndex);
-                            },
-                            itemBuilder: (context, index) => _UpNextTile(
-                              // Index-qualified so the same track queued twice
-                              // never produces a duplicate key (which would crash
-                              // the reorderable list).
-                              key: ValueKey<String>(
-                                'queue-$index-${upNext[index].id}',
-                              ),
-                              track: upNext[index],
-                              index: index,
-                              onPlay: () => ref
-                                  .read(playbackControllerProvider)
-                                  .playFromQueue(index),
-                              onRemove: () => ref
-                                  .read(playbackControllerProvider)
-                                  .removeFromQueue(index),
-                            ),
-                          ),
-                        const SliverToBoxAdapter(
-                          child: SizedBox(height: AppSpacing.md),
-                        ),
-                      ],
-                    ),
-            ),
-          ],
-        ),
+        child: body,
       ),
     );
   }
@@ -168,7 +213,12 @@ class QueueSheet extends ConsumerWidget {
     BuildContext context,
     WidgetRef ref,
   ) async {
+    // Both captured before the dialog: embedded in the player's queue pane,
+    // this sheet is unmounted the moment the window narrows past the pane's
+    // minimum, and a resize while the name prompt is up would otherwise leave
+    // the save reaching through a disposed ref on submit.
     final ScaffoldMessengerState messenger = ScaffoldMessenger.of(context);
+    final PlaylistRepository repository = ref.read(playlistRepositoryProvider);
     // Read the freshest full queue at tap time rather than capturing it in
     // build — build now selects only the queue identity (see above), and a save
     // is a one-off action, not a hot path.
@@ -183,7 +233,6 @@ class QueueSheet extends ConsumerWidget {
     final PlaylistEdit? edit = await showCreatePlaylistDialog(context);
     if (edit == null) return;
 
-    final repository = ref.read(playlistRepositoryProvider);
     final Playlist created = await repository.createPlaylist(
       edit.name,
       description: edit.description,
@@ -314,6 +363,196 @@ class _HistoryTile extends StatelessWidget {
   }
 }
 
+/// A track from the session's recent-playback history.
+///
+/// Tapping it plays that song again through the normal path — the queue if it
+/// is still in it, the ordinary play path otherwise (see
+/// [playFromRecentHistory]). The row carries a catalog [Track] and nothing
+/// else, so a replay always resolves a fresh playable source.
+class _RecentlyPlayedTile extends StatelessWidget {
+  const _RecentlyPlayedTile({required this.entry, required this.onTap});
+
+  final PlaybackHistoryEntry entry;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final ThemeData theme = Theme.of(context);
+    final Track track = entry.track;
+    final String? artist = track.artistName;
+    final Color muted = theme.colorScheme.onSurface.withValues(alpha: 0.7);
+    return ListTile(
+      dense: true,
+      onTap: onTap,
+      leading: SizedBox.square(
+        dimension: 40,
+        child: Opacity(
+          opacity: 0.6,
+          child: AlbumArtwork(
+            artworkUri: track.artworkUri,
+            borderRadius: const BorderRadius.all(Radius.circular(AppRadii.sm)),
+          ),
+        ),
+      ),
+      title: Text(
+        track.title,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: theme.textTheme.bodyLarge?.copyWith(color: muted),
+      ),
+      subtitle: artist == null || artist.isEmpty
+          ? null
+          : Text(artist, maxLines: 1, overflow: TextOverflow.ellipsis),
+      trailing: Tooltip(
+        message: entry.wasCompleted ? 'Played to the end' : 'Skipped',
+        child: Icon(
+          entry.wasCompleted
+              ? Icons.check_circle_outline
+              : Icons.skip_next_outlined,
+          size: 18,
+          color: muted,
+        ),
+      ),
+    );
+  }
+}
+
+/// The one line that makes the retention bound visible where it applies, so a
+/// listener is never left wondering why an older song fell off the list.
+class _RecentHistoryFootnote extends StatelessWidget {
+  const _RecentHistoryFootnote({required this.limit});
+
+  final int limit;
+
+  @override
+  Widget build(BuildContext context) {
+    final ThemeData theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(
+        AppSpacing.lg,
+        AppSpacing.xs,
+        AppSpacing.lg,
+        0,
+      ),
+      child: Text(
+        'The last $limit tracks of this session. Nothing is saved to disk.',
+        style: theme.textTheme.bodySmall?.copyWith(
+          color: theme.colorScheme.onSurface.withValues(alpha: 0.6),
+        ),
+      ),
+    );
+  }
+}
+
+/// The reorderable "Up next" list.
+///
+/// Stateful for one reason: keyboard reordering. A pointer drag carries the row
+/// under the pointer, so the framework keeps the gesture aimed at the right
+/// track by itself. A keyboard move is a jump instead — the list rebuilds with
+/// the moved track a row away — so focus has to be handed to the row it landed
+/// on, or a second Ctrl+Arrow would move whatever slid into the old position.
+///
+/// The focus nodes are per *position*, not per track, which is what makes that
+/// work: after the rebuild the node at the destination index is the moved
+/// track's handle. Keying them by track would mean a new node per queue edit,
+/// and a duplicate node whenever the same song is queued twice.
+class _UpNextList extends ConsumerStatefulWidget {
+  const _UpNextList({required this.tracks});
+
+  final List<Track> tracks;
+
+  @override
+  ConsumerState<_UpNextList> createState() => _UpNextListState();
+}
+
+class _UpNextListState extends ConsumerState<_UpNextList> {
+  final ReorderFocusWalk _walk =
+      ReorderFocusWalk(debugLabelPrefix: 'queue-handle');
+
+  @override
+  void didUpdateWidget(_UpNextList oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // A reorder always produces a new list, so a changed identity means the
+    // rows now carry post-move indices and the walk state has served its turn.
+    if (!identical(widget.tracks, oldWidget.tracks)) _walk.reset();
+  }
+
+  @override
+  void dispose() {
+    _walk.dispose();
+    super.dispose();
+  }
+
+  /// Moves the up-next track at [from] to [to] (both 0-based into up-next,
+  /// [to] being the destination after removal — the index a normalised
+  /// reorderable list reports, and the one [PlaybackQueue.reorderUpNext] takes).
+  ///
+  /// Out-of-range moves are dropped here as well as in the queue model, so a
+  /// keyboard press at either end of the list, or an index left stale by a
+  /// queue that changed under the open sheet, is simply harmless.
+  bool _move(int from, int to) {
+    final int count = widget.tracks.length;
+    if (from < 0 || from >= count) return false;
+    if (to < 0 || to >= count || to == from) return false;
+    ref.read(playbackControllerProvider).reorderQueue(from, to);
+    return true;
+  }
+
+  /// Moves the track the handle on row [rowIndex] belongs to by [delta]
+  /// positions — the keyboard and screen-reader route.
+  void _moveBy(int rowIndex, int delta) {
+    final int from = _walk.sourceFor(rowIndex);
+    final int to = from + delta;
+    if (!_move(from, to)) return;
+    _walk.recordMove(rowIndex: rowIndex, to: to);
+    _walk.followTo(to, delta);
+  }
+
+  /// Applies a pointer drop, carrying keyboard focus along with the row that
+  /// held it.
+  ///
+  /// Focus nodes are per position, so a drag changes which track the focused
+  /// node belongs to. Left alone, a Ctrl+Arrow after a drag reorders whichever
+  /// neighbour slid under the focus rather than the track just dropped. The
+  /// remap covers any focused row, not only the dragged one: a drag past a
+  /// focused row shifts that row too.
+  ///
+  /// Nothing happens when no handle has focus, so a plain mouse drag never
+  /// pulls focus into the list.
+  void _moveByPointer(int from, int to) {
+    final int focused = _walk.focusedIndex;
+    if (!_move(from, to)) return;
+    if (focused < 0) return;
+    _walk.followTo(
+      ReorderFocusWalk.positionAfterMove(focused, from: from, to: to),
+      to - from,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final List<Track> tracks = widget.tracks;
+    return SliverReorderableList(
+      itemCount: tracks.length,
+      onReorderItem: _moveByPointer,
+      proxyDecorator: liftedReorderProxy,
+      itemBuilder: (context, index) => _UpNextTile(
+        // Index-qualified so the same track queued twice never produces a
+        // duplicate key (which would crash the reorderable list).
+        key: ValueKey<String>('queue-$index-${tracks[index].id}'),
+        track: tracks[index],
+        index: index,
+        count: tracks.length,
+        handleFocusNode: _walk.nodeAt(index),
+        onPlay: () => ref.read(playbackControllerProvider).playFromQueue(index),
+        onRemove: () =>
+            ref.read(playbackControllerProvider).removeFromQueue(index),
+        onMoveBy: (int delta) => _moveBy(index, delta),
+      ),
+    );
+  }
+}
+
 /// An upcoming track: tap to play now, an X to remove it from the queue, and a
 /// drag handle to reorder. Removing only drops the queue entry — it never
 /// deletes the track from the library or its offline copy.
@@ -321,15 +560,23 @@ class _UpNextTile extends StatelessWidget {
   const _UpNextTile({
     required this.track,
     required this.index,
+    required this.count,
+    required this.handleFocusNode,
     required this.onPlay,
     required this.onRemove,
+    required this.onMoveBy,
     super.key,
   });
 
   final Track track;
   final int index;
+  final int count;
+  final FocusNode handleFocusNode;
   final VoidCallback onPlay;
   final VoidCallback onRemove;
+
+  /// Moves this row by [delta] positions (-1 up, +1 down).
+  final ValueChanged<int> onMoveBy;
 
   @override
   Widget build(BuildContext context) {
@@ -357,15 +604,11 @@ class _UpNextTile extends StatelessWidget {
               tooltip: 'Remove from queue',
               onPressed: onRemove,
             ),
-            ReorderableDragStartListener(
+            ReorderHandle(
               index: index,
-              child: const Padding(
-                padding: EdgeInsets.only(left: AppSpacing.xs),
-                child: Icon(
-                  Icons.drag_handle,
-                  semanticLabel: 'Reorder',
-                ),
-              ),
+              count: count,
+              focusNode: handleFocusNode,
+              onMoveBy: onMoveBy,
             ),
           ],
         ),
